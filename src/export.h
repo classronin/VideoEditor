@@ -11,9 +11,10 @@
 struct ExportCommand {
   std::vector<std::wstring> args;  // 不含可执行文件名
   std::wstring graph;              // filter_complex 原文，便于排查
-  // 逐帧表达式会让图远超命令行的 32767 字符上限，这时改成把图写进文件、用
-  // -/filter_complex 读。文件由 Exporter 在进程结束后删掉。
-  std::wstring graph_file;
+  // 导出进程活着期间要读的临时文件：逐帧表达式的图可以长到几十万字符，命令行（32767）
+  // 装不下，只能写进文件用 -/filter_complex 读；文本条带的画面是排版器现排的位图，ffmpeg
+  // 只认文件，所以落成 PNG。两边都由 Exporter 在进程结束时删掉。
+  std::vector<std::wstring> temp_files;
   double total_seconds = 0;
 };
 
@@ -33,11 +34,11 @@ class Exporter {
 
  private:
   void consume();
-  void drop_graph_file();
+  void drop_temp_files();
   std::unique_ptr<FrameProc> proc_;
   std::vector<uint8_t> buf_;
   std::wstring out_;
-  std::wstring graph_file_;
+  std::vector<std::wstring> temp_files_;
   double total_ = 0, done_ = 0;
   bool running_ = false;
   std::wstring message_;

@@ -48,8 +48,11 @@ struct Item {
   bool active = false;  // 正在拖动/编辑：用 inner_sel
   bool hot = false;     // 光标在下（只有 pulldown/menu/tab/push 有悬停底色）
   int state = 0;        // Toggle 的开关值；Tab 的选中序号
-  // 画出来的那串字在按钮里的左右边界：点进框里放光标、拖选数字要按它换算字符下标。
-  float text_x = 0.0f, text_w = 0.0f;
+  // 画出来的那串字在按钮里的左边界：点进框里放光标、拖选文字要按它换算字符下标。
+  float text_x = 0.0f;
+  // 文本框按行排版时这一行的行高（0 = 单行，整个串就是一行）。落光标要按它把指针的
+  // y 换成第几行，见 text_index_at 的那个重载。
+  float line_h = 0.0f;
   // 登记时落在 block 的裁剪框外 ⇒ 这一格看不见，也不收事件（见 Block::set_clip）。
   bool off_clip = false;
 };
@@ -63,7 +66,7 @@ class Block {
     Item &n = items_.back();
     // 整块在裁剪框外 = 看不见 = 也不许收事件：面板滚出 region 的那几行如果还能点，
     // 伸到时间线那一块里的像素就会替面板答这一击。判据用「整块在框内」而不是「有重叠」，
-    // 因为 Item::rect 同时是文字定位的基准（text_x/text_w 按它换算），不能偷偷改成裁剪后
+    // 因为 Item::rect 同时是文字定位的基准（text_x 按它换算），不能偷偷改成裁剪后
     // 那一截；差几像素没露全的行露全了自然能点。
     if (has_clip_ && !(n.rect.x >= clip_.x && n.rect.y >= clip_.y &&
                        n.rect.x + n.rect.w <= clip_.x + clip_.w &&
@@ -126,8 +129,18 @@ struct TextSel {
   int sel = 0;
 };
 
-// 指针 x 落在串里的哪个字符边界（0..len，取最近的一个）。
+// 多行框里一行的字符区间：[begin, end) 是这一行本身，不含行尾那个换行符
+// （换行符占 end 那一格，归上一行的末尾）。上下键换行要用它找邻行。
+struct TextLine {
+  int begin, end;
+};
+std::vector<TextLine> text_lines(const std::wstring &s);
+
+// 指针落在串里的哪个字符边界。单行框只问 x；框子按行排版（line_h > 0）时 \n 是真换行，
+// 光标行由 y 定，行内列再由 x 定 —— 两个重载共用同一条「取最近的边界」规则。
 int text_index_at(Render2D &r, const std::wstring &s, float text_x, float x);
+int text_index_at(Render2D &r, const std::wstring &s, const Rect &cell, float text_x, float line_h,
+                  float x, float y);
 
 Rect but_num(Render2D &r, Block &blk, int id, const Rect &area, const wchar_t *label,
              const std::wstring &text, double softmin, double softmax, double step, double value,
@@ -139,8 +152,10 @@ Rect but_push(Render2D &r, Block &blk, int id, const Rect &area, const std::wstr
               bool hot = false);
 Rect but_pulldown(Render2D &r, Block &blk, int id, const Rect &area, const std::wstring &text,
                   bool hot);
+// 文本输入框。line_h > 0 = 多行框：串里的 \n 各占一行，每行行高 line_h，格子放不下
+// （比如正在敲、行数又顶出一格）就裁在框内而不是让字爬出去。
 Rect but_text(Render2D &r, Block &blk, int id, const Rect &area, const std::wstring &text,
-              bool active, const TextSel *ts = nullptr);
+              bool active, const TextSel *ts = nullptr, float line_h = 0.0f);
 Rect but_tab(Render2D &r, Block &blk, int id, const Rect &area, const std::wstring &glyph,
              bool selected, bool hot);
 void draw_label(Render2D &r, const Rect &area, const std::wstring &text, Color col);
@@ -161,6 +176,7 @@ struct Entry {
   int submenu = -1;       // MenuTable 的下标
   bool sep = false;
   bool enabled = true;
+  bool selected = false;  // 枚举下拉里的当前值：左侧打勾（ICON_CHECKMARK）
 };
 
 using MenuTable = std::vector<std::vector<Entry>>;
@@ -170,6 +186,10 @@ struct Level {
   Rect rect;                 // 面板矩形（客户区像素）
   std::vector<Rect> rows;    // 与 entries 一一对应（分隔线也占一行，高度不同）
   int hover = -1;
+  // 这一层给勾让出的列宽：量宽和画字都读它，不在两处各算一遍。
+  float icon_w = 0.0f;
+  // 名单比客户区高时（字体名单），面板只占客户区那么高，行往上翻这么多像素。
+  float scroll = 0.0f;
 };
 
 class Popover {
@@ -182,6 +202,8 @@ class Popover {
   int depth() const { return int(stack_.size()); }
 
   bool on_move(float x, float y);
+  // 滚轮翻最长的那一层；返回是否真的动了（没动就不标脏）。
+  bool on_wheel(short delta);
   // 单击：>0 = 命中的命令 id；-1 = 关闭了菜单；0 = 未处理。
   int on_click(float x, float y);
   // 键盘：Esc 收起一层，Enter 执行悬停项（返回命令 id 或 -1），上下移动悬停。

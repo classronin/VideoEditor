@@ -82,18 +82,50 @@ struct RetimeKey {
 // transform.seq_clip_handles 裁的就是「带这颗标志的全部条带」。
 enum StripHandle : int { kHandleNone = 0, kHandleLeft = 1, kHandleRight = 2 };
 
+// Strip::type 的三档。Blender 的 DNA_sequence_types.h 只有 STRIP_TYPE_MOVIE / STRIP_TYPE_SOUND，
+// 文本在它那里是「影片条带 + effectdata 里的 TextVars」（SEQ_TEXT effect）；本工程没有 effect 栈，
+// 文本自己成一档，好处是所有「这条路只对影片成立」的判断都写成 kind 而不是「非声音」。
+enum StripKind : int { kStripMovie = 0, kStripSound = 1, kStripText = 2 };
+
+// 文本条带的内容与样式，逐项对齐 TextVars（makesdna/DNA_sequence_types.h）与
+// sequencer/intern/effects/effect_text.cc 的 init_text_effect（:187-222）。
+// Blender 另有 SEQ_TEXT_OUTLINE / SEQ_TEXT_BORDER 两颗开关标志；这里不存它们，
+// 因为算子里的判据本来就含 alpha（effect_text.cc 的门是
+// `outline_width < 1 || outline_color[3] <= 0`），alpha 为 0 就是关。所以出厂默认的
+// 轮廓/方框 alpha 写 0 = 关（Blender 的默认是「颜色存着但标志没开」，同一个观感）。
+struct TextVars {
+  std::wstring content = L"你好，世界";  // Blender 默认 "Text"；换行用 '\n'（手动回车，不做自动换行）
+  std::wstring family = L"Microsoft YaHei";  // DirectWrite 的家族名，出厂默认（本机字体表里确有此项）
+  bool bold = false, italic = false;         // 对应 TextVars::flag 的 SEQ_TEXT_BOLD / _ITALIC
+  // text_size 在 Blender 里就是「输出像素」，只按预览渲染比例折算一次
+  // （text_effect_line_size_get，:797-807：size_scale * text_size）⇒ 这里存原值。
+  double size = 60.0;
+  // 行距倍数：Blender 的 space_line 默认 1.0，行高 = 字体自己的自然行高 * space_line；
+  // 排版器按 PROPORTIONAL 把倍数落在自然行高上（见 text.cpp），所以这里只存倍数。
+  double line_spacing = 1.0;
+  float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // copy_v4_fl(data->color, 1.0f)
+  float outline_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  // 宽度是相对量：Blender 换算成像素用 outline_width * line_height * 0.5（见 text.cpp）。
+  double outline_width = 0.05;
+  float box_color[4] = {0.2f, 0.2f, 0.2f, 0.0f};
+  double box_margin = 0.01;      // 相对画布宽（Blender：box_margin * image->x）
+  double box_roundness = 0.0;    // 0..1，圆角半径 = roundness * 盒高 / 2
+};
+
 struct Clip {
   std::wstring source_path;
   const VideoInfo *info = nullptr;  // 由 MediaCache 持有
   int64_t id = 0;
   int track = 0;                // 所在通道（下标 0 = Blender 的 Channel 1）
-  // Strip::type 的两档（DNA_sequence_types.h:127-128 的 STRIP_TYPE_MOVIE / STRIP_TYPE_SOUND）：false = MOVIE、
-  // true = SOUND。导入带音轨的影片时，音轨是一条独立的 SOUND 条带，落在影片下面的通道，
-  // 和影片自动连接（sequencer_add.cc:1334/1350 的通道分配、:1394-1400 的连接）。
-  // 只有 SOUND 条带发声：BKE_sound_add_scene_sound 先判 strip->sound == nullptr 就直接返回
+  // 导入带音轨的影片时，音轨是一条独立的 SOUND 条带，落在影片下面的通道，和影片自动连接
+  // （sequencer_add.cc:1334/1350 的通道分配、:1394-1400 的连接）。只有 SOUND 条带发声：
+  // BKE_sound_add_scene_sound 先判 strip->sound == nullptr 就直接返回
   // （blenkernel/intern/sound.cc:945-951），而 strip->sound 只在 add_sound_strip 里赋值
   // （sequencer/intern/strip_add.cc:323）⇒ 影片条带本身不带声音。
-  bool is_sound = false;
+  StripKind kind = kStripMovie;
+  // kind == kStripText 时才有内容；其余两档忽略它（不另开 union：一份 Clip 表要能整体拷贝进
+  // 撤消快照，成员的默认值就是「没设过」的样子）。
+  TextVars text;
   double timeline_start = 0.0;  // 秒
   double source_in = 0.0;       // 秒
   double duration = 0.0;        // 秒（时间线上）

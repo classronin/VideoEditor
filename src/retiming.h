@@ -27,7 +27,7 @@
 double retiming_content(const Clip &c);
 // 这条带能不能参与变速：retiming_is_allowed（strip_retiming.cc:154-169）先否掉
 // content_length() ≤ 1 帧的素材（一帧没有可拉伸的余量），再按类型白名单放行。
-// 本工程导入的都是影片/图像/声音条带，全在名单里，所以只剩帧数这一项。
+// 影片/图像/声音在名单里，只剩帧数这一项；文本不在名单里，先看类型就否掉。
 bool retiming_is_allowed(const Clip &c, double frame_dur);
 
 // 求值：x（距左缘秒）→ 源内秒。空曲线 ⇒ source_in + x。

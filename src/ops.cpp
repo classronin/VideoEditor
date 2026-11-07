@@ -2,6 +2,7 @@
 // 每个数字/名字都标了它在参考树里的出处（Blender 5.4）。
 #include "app.h"
 
+#include <commdlg.h>
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <windowsx.h>
@@ -14,6 +15,7 @@
 #include "ffmpegget.h"
 #include "gesture.h"
 #include "settings.h"
+#include "text.h"
 
 namespace app {
 
@@ -481,12 +483,27 @@ Rect view_rect(const App &a) {
 // transform，全程不比较源与画布的长宽比；center_in_canvas（:451-452）把画面中心对到画布中心。
 // 于是画面按源像素原尺寸摆着，比画布大就被画布裁掉、比画布小就露出画布底色。
 Rect clip_base_rect(const App &a, const Clip &c, const Rect &box) {
-  if (!c.info || !c.info->width || !c.info->height) return box;
   const OutputFormat &f = a.project.fmt;
-  if (f.width < 1 || f.height < 1) return box;
-  const float w = box.w * float(c.info->width) / float(f.width);
-  const float h = box.h * float(c.info->height) / float(f.height);
+  int sw = 0, sh = 0;
+  clip_source_size(a, c, &sw, &sh);
+  if (!sw || !sh || f.width < 1 || f.height < 1) return box;
+  const float w = box.w * float(sw) / float(f.width);
+  const float h = box.h * float(sh) / float(f.height);
   return {box.x + (box.w - w) * 0.5f, box.y + (box.h - h) * 0.5f, w, h};
+}
+
+void clip_source_size(const App &a, const Clip &c, int *w, int *h) {
+  // 文本的「源」就是排版器现排出来的那张位图，它的像素就是输出像素
+  // （Blender 的 text_size 同样以渲染缓冲像素计，text_effect_line_size_get :797-807）。
+  // 画布宽只因为方框边距是它的比例才参与，所以传格式面板的宽。
+  if (c.kind == kStripText) {
+    const txt::Bitmap *bm = txt::bitmap(c.text, a.project.fmt.width);
+    *w = bm ? bm->w : 0;
+    *h = bm ? bm->h : 0;
+    return;
+  }
+  *w = c.info ? c.info->width : 0;
+  *h = c.info ? c.info->height : 0;
 }
 
 // 1 输出像素在屏幕上占多少像素，横竖各一个：横 = 画幅屏幕宽 ÷ 格式面板的宽，
@@ -510,8 +527,10 @@ void clip_screen_quad(const App &a, const Clip &c, const Rect &box, float *pts, 
   const Rect r = clip_base_rect(a, c, box);
   const float bx = r.x + r.w * 0.5f, by = r.y + r.h * 0.5f;
   const float hw = r.w * 0.5f, hh = r.h * 0.5f;
-  const double w = c.info && c.info->width ? double(c.info->width) : 1.0;
-  const double h = c.info && c.info->height ? double(c.info->height) : 1.0;
+  int sw = 0, sh = 0;
+  clip_source_size(a, c, &sw, &sh);
+  const double w = sw > 0 ? double(sw) : 1.0;
+  const double h = sh > 0 ? double(sh) : 1.0;
   const float u0 = float(std::clamp(c.crop_l / w, 0.0, 1.0)),
               u1 = float(std::clamp(1.0 - c.crop_r / w, 0.0, 1.0));
   const float v0 = float(std::clamp(c.crop_t / h, 0.0, 1.0)),
@@ -920,9 +939,12 @@ std::vector<Clip *> selected_clips(App &a) {
   return out;
 }
 
-Clip *props_clip(App &a) {
-  if (a.selected >= 0)
-    if (Clip *c = find_clip(a, a.selected)) return c;
+// 面板作用的那条带。整个「这一组画不给谁看」的判断都从它出发，所以它必须能在只读的
+// 那一趟（量高度）里被问出来 —— 写指针的来源和读指针的来源是同一处，不是两套账。
+Clip *props_clip(const App &a) {
+  if (a.selected < 0) return nullptr;
+  for (const Clip &c : a.project.clips)
+    if (c.id == a.selected) return const_cast<Clip *>(&c);
   return nullptr;
 }
 
@@ -953,7 +975,7 @@ std::vector<Clip *> rendered_clips(const App &a, double t) {
     if (c.track < int(a.project.tracks.size()) && a.project.tracks[c.track].muted) continue;
     // 声音条带不参与画面（iterator.cc:224 的 collection_filter_rendered_strips：
     // `strip->type == STRIP_TYPE_SOUND || render_is_muted(...)` 为真就跳过）。
-    if (c.is_sound) continue;
+    if (c.kind == kStripSound) continue;
     out.push_back(const_cast<Clip *>(&c));
   }
   std::sort(out.begin(), out.end(), [](const Clip *x, const Clip *y) {
@@ -972,7 +994,7 @@ std::vector<Clip *> rendered_clips(const App &a, double t) {
 // （sequencer/intern/strip_add.cc:323）⇒ 一部影片的声音归那条 SOUND 条带管，
 // 裁它、挪它、删它都只影响声音。
 static bool sound_eligible(const App &a, const Clip &c) {
-  if (!c.is_sound) return false;
+  if (c.kind != kStripSound) return false;
   if (c.muted) return false;
   if (c.track < 0) return false;
   if (c.track < int(a.project.tracks.size()) && a.project.tracks[c.track].muted) return false;
@@ -1013,10 +1035,19 @@ void recompute_duration(App &a) { a.project.duration = project_end(a); }
 
 static void propagate_selection(App &a, int64_t id);  // 定义在 clear_selection 后面
 
+// 选中换了人，面板就演他那一种。和种类按钮写的是同一格 a.panel_kind（同一个意思的两个
+// 来路：按按钮 = 我要看这一种，点条带 = 我看的就是这一种），读的人只有 panel_shown 和
+// 那两颗按钮。id 找不到条带（清空选中）时不动它：那是「没有新答案」，不是「换成视频」。
+static void panel_follow(App &a, int64_t id) {
+  const Clip *c = find_clip(a, id);
+  if (c) a.panel_kind = c->kind;
+}
+
 void select_only(App &a, int64_t id) {
   a.sel.clear();
   if (id >= 0) a.sel.push_back(id);
   a.selected = id;
+  panel_follow(a, id);
   propagate_selection(a, id);
   trace_links(a, L"click");
   a.dirty |= kRLanes | kRProps | kRViewport;
@@ -1026,6 +1057,7 @@ void add_to_selection(App &a, int64_t id) {
   if (id < 0) return;
   if (!clip_selected(a, id)) a.sel.push_back(id);
   a.selected = id;
+  panel_follow(a, id);
   propagate_selection(a, id);
   trace_links(a, L"shift-click");
   a.dirty |= kRLanes | kRProps;
@@ -1040,6 +1072,7 @@ void toggle_selection(App &a, int64_t id) {
   // 活动条带永远落在被点的那条上（sequencer_select_set_active(scene, selection.strip1)，
   // :1224 无条件执行，取消选中也不换）—— 和上面 clear_selection 注释里那条约定一致。
   a.selected = id;
+  panel_follow(a, id);
   trace_links(a, L"ctrl-click");
   a.dirty |= kRLanes | kRProps;
 }
@@ -1361,6 +1394,24 @@ const PropSpec &prop_spec(int id) {
   // （sequencer_retiming.cc:701-709）—— 百分数，硬下限 0.001，软下限 0.1，无上限。
   // 未声明 precision ⇒ Blender 的浮点默认 2 位小数。
   static const PropSpec speed{0.1, big, 0.001, big, 10, 2, true};
+  // 文本样式（TextVars）。字号在 Blender 里就是输出像素（text_effect_line_size_get 只按
+  // 预览渲染比例折算一次），所以这里给整数、下限 1：填到 0 以下排版器直接不出图（那是它
+  // 自己的门，不是界面替它设的界）。
+  // 这四行的上限是裁决定的（字号 300、行距 3、轮廓宽 0.2、边距 0.1），不是 RNA 给的：
+  // Blender 那边这四个属性都是到 FLT_MAX。上限同时就是那一格进度条的两端 —— 滑块没有
+  // 上限可画，所以定上限和加进度条是同一笔。键入超界的数被夹回上限，不报错也不越界。
+  static const PropSpec t_size{1, 300, 1, 300, 10, 0, false};
+  // 行距 = 自然行高的倍数（DWrite 的 PROPORTIONAL）。
+  static const PropSpec t_line{0.1, 3, 0.1, 3, 10, 2, true};
+  // 轮廓宽、方框边距、方框圆度都是相对量：轮廓按行高、边距按画布宽、圆度按盒高的一半
+  // （三处算式都在 text.cpp，逐条抄 Blender）。界面上就按原值给，不换成像素 —— 换了
+  // 就是同一个数两处各有意思。
+  static const PropSpec t_outline{0, 0.2, 0, 0.2, 10, 3, true};
+  static const PropSpec t_margin{0, 0.1, 0, 0.1, 10, 3, true};
+  static const PropSpec t_round{0, 1, 0, 1, 10, 3, true};
+  // 颜色：RGB 按 0..255 给（对象里存的是 0..1 的浮点，读写各折算一次），不透明度按百分数。
+  static const PropSpec t_rgb{0, 255, 0, 255, 10, 0, false};
+  static const PropSpec t_alpha{0, 100, 0, 100, 10, 0, false};
   switch (id) {
     case kFResX: case kFResY: return res;
     case kFResPct: return pct;
@@ -1378,6 +1429,15 @@ const PropSpec &prop_spec(int id) {
     case kFOriginX: case kFOriginY: return origin;
     case kFCropMinX: case kFCropMaxX: case kFCropMinY: case kFCropMaxY: return crop;
     case kFSpeed: return speed;
+    case kFTextSize: return t_size;
+    case kFTextLineSpacing: return t_line;
+    case kFTextOutlineWidth: return t_outline;
+    case kFTextBoxMargin: return t_margin;
+    case kFTextBoxRoundness: return t_round;
+    case kFGlyphR: case kFGlyphG: case kFGlyphB:
+    case kFOutlineR: case kFOutlineG: case kFOutlineB:
+    case kFBoxR: case kFBoxG: case kFBoxB: return t_rgb;
+    case kFGlyphA: case kFOutlineA: case kFBoxA: return t_alpha;
     default: return frame;
   }
 }
@@ -1397,7 +1457,15 @@ double strip_speed_get(App &a, const Clip *c) {
   return retiming_key_speed(*c, c->retiming.size() - 1);
 }
 
-double prop_value(App &a, int id, const Clip *c) {
+// 文本那十二格颜色 = 三层（字形 / 轮廓 / 方框）× 四通道（R G B A）：换算在 app.h 的
+// text_layer / text_color_at，读写和画色块都问同一处。
+
+// 文本行落到哪一份 TextVars：见 app.h 的声明。这一句是那个问题唯一的答案。
+TextVars &text_target(App &a, Clip *c) {
+  return c && c->kind == kStripText ? c->text : a.text_def;
+}
+
+double prop_value(App &a, int id, Clip *c) {
   const OutputFormat &f = a.project.fmt;
   switch (id) {
     case kFResX: return f.width;
@@ -1412,6 +1480,27 @@ double prop_value(App &a, int id, const Clip *c) {
     case kFFrameStep: return f.frame_step;
     case kFBitrate: return f.bitrate;
     default: break;
+  }
+  // 文本那几格（数值 + 颜色）不挑条带：面板演文本这一种时读的是 text_target，没有文本带
+  // 就是 a.text_def。这一问排在「没有条带就返回 0」之前：排在其后就等于两处各自回答一次
+  // 「没有」，面板会把默认值显示成 0。
+  if (is_text_field(id) && id != kFTextContent) {
+    TextVars &t = text_target(a, c);
+    if (is_color_field(id)) {  // 行列由 id 算出（见 text_color_at）
+      int layer = 0, ch = 0;
+      double sc = 1.0;
+      text_color_at(id, &layer, &ch, &sc);
+      return double(text_layer(t, layer)[ch]) * sc;
+    }
+    switch (id) {
+      case kFTextSize: return t.size;
+      case kFTextLineSpacing: return t.line_spacing;
+      case kFTextOutlineWidth: return t.outline_width;
+      case kFTextBoxMargin: return t.box_margin;
+      case kFTextBoxRoundness: return t.box_roundness;
+      default: break;
+    }
+    return 0.0;
   }
   if (!c) {
     // 键选中模式的速度读的是选中的键，跟面板落到哪条带无关（strip_speed_get 的
@@ -1441,11 +1530,14 @@ double prop_value(App &a, int id, const Clip *c) {
     // 面板按 Blender 的 speed 属性显示百分数，读数走 strip_speed_get（:581-603）：
     // 条带模式 = 右把手那把键收尾的那一段（最后一段），键选中模式 = 选中那把键收尾的段。
     case kFSpeed: return strip_speed_get(a, c) * 100.0;
-    default: return 0.0;
+    default: break;
   }
+  return 0.0;
 }
 
-std::wstring prop_text(App &a, int id, const Clip *c) {
+std::wstring prop_text(App &a, int id, Clip *c) {
+  // 内容那一格显示的就是串本身：没有单位、不做数值换算。
+  if (is_string_field(id)) return prop_string(a, c);
   const PropSpec &s = prop_spec(id);
   double v = prop_value(a, id, c);
   std::wstring t = num_str(v, s.precision);
@@ -1455,9 +1547,21 @@ std::wstring prop_text(App &a, int id, const Clip *c) {
     case kFRotation: t += L"°"; break;
     case kFFps: case kFFpsBase: t += L" fps"; break;
     case kFBitrate: t += L" kbit/s"; break;  // RNA 的单位就写在这句话里（"Video bitrate (kbit/s)"）
+    // 不透明度给百分数（对象里存的是 0..1 的 alpha，读写各折算一次）。
+    case kFGlyphA: case kFOutlineA: case kFBoxA: t += L"%"; break;
     default: break;
   }
   return t;
+}
+
+std::wstring prop_string(App &a, Clip *c) { return text_target(a, c).content; }
+
+// 内容那一行的写入。空串是合法值：排版器读它判「这一帧没有画面」，和 Blender 的
+// early_out_text 同一道门，所以清空 = 字真的没了，不是「什么都没填所以不算」。
+void text_content_set(App &a, const std::wstring &s) {
+  text_target(a, props_clip(a)).content = s;
+  a.dirty |= kRViewport | kRProps;
+  sync_preview(a);
 }
 
 // 变换的一个通道怎么写：挂了曲线就在当前帧落键，没曲线就写标量。
@@ -1558,6 +1662,31 @@ bool prop_apply(App &a, int id, Clip *c, double v, bool pair) {
     retiming_prune_sel(a);
     recompute_duration(a);
     a.dirty |= kRViewport | kRProps | kRLanes;
+    sync_preview(a);
+    return true;
+  }
+  // 文本样式行：落点由 text_target 回答 —— 选中的是文本带就写它自己，否则写 a.text_def
+  // （新建文本带继承的那一份）。种类按钮放开以后「面板演文本、手上没有文本带」是常态，
+  // 所以这一行不再有「先选中一条文本」那种拒绝；它排在 !c 之前，否则空手时写不进去、
+  // 读数却读得到，就成了同一个值两处各有答案。
+  if (is_text_field(id)) {
+    TextVars &t = text_target(a, c);
+    if (is_color_field(id)) {
+      int layer = 0, ch = 0;
+      double sc = 1.0;
+      text_color_at(id, &layer, &ch, &sc);
+      text_layer(t, layer)[ch] = float(v / sc);  // 界面上的 0..255 / 0..100 折回 0..1
+    } else {
+      switch (id) {
+        case kFTextSize: t.size = v; break;
+        case kFTextLineSpacing: t.line_spacing = v; break;
+        case kFTextOutlineWidth: t.outline_width = v; break;
+        case kFTextBoxMargin: t.box_margin = v; break;
+        case kFTextBoxRoundness: t.box_roundness = v; break;
+        default: return false;
+      }
+    }
+    a.dirty |= kRViewport | kRProps;
     sync_preview(a);
     return true;
   }
@@ -1757,7 +1886,8 @@ void speed_dot_click(App &a, Clip *c) {
     return;
   }
   if (!retiming_is_allowed(*c, a.frame_dur())) {
-    set_status(a, L"这条带没得变速：素材太短");
+    set_status(a, c->kind == kStripText ? L"文本条带没有变速：它不是一段素材"
+                                        : L"这条带没得变速：素材太短");
     return;
   }
   if (!retiming_add_key(*c, x)) {
@@ -1793,6 +1923,17 @@ void keyframe_dot_click(App &a, int field) {
 //   use_flip_x / use_flip_y = SEQ_FLIPX / SEQ_FLIPY（rna_sequencer.cc:3187-3195）
 //   mute / lock = SEQ_MUTE / SEQ_LOCK（:2674-2686）
 bool prop_toggle(App &a, int id, Clip *c) {
+  // 粗体/斜体写在 TextVars 的 flag 位上，落点和文本那几行同一处（text_target）：没有文本带
+  // 时也翻得动，翻的是新建文本带继承的那一份。
+  if (id == kFTextBold || id == kFTextItalic) {
+    TextVars &t = text_target(a, c);
+    bool &b = id == kFTextBold ? t.bold : t.italic;
+    b = !b;
+    a.dirty |= kRViewport | kRProps;
+    sync_preview(a);
+    undo_push(a, L"文本字形");
+    return true;
+  }
   if (!c) return false;
   switch (id) {
     case kFFlipX: c->flip_x = !c->flip_x; break;
@@ -1820,6 +1961,9 @@ void sync_preview(App &a) {
   std::vector<Preview::Target> targets;
   targets.reserve(stack.size());
   for (Clip *c : stack) {
+    // 解码这条路只有影片能走：声带不产画面，文本的画面是排版器现排的（clip_source_size），
+    // 两者都没有源文件可解。
+    if (c->kind != kStripMovie) continue;
     // 解码尺寸按「条带在屏幕上的大小」要：画面不再缩放适配（见 clip_base_rect），源比画布大时
     // 屏幕上占的像素比画布还多，按画布解码等于把小图放大糊掉。上限取源本身——超源解码没有信息。
     const int sw = c->info->width, sh = c->info->height;
@@ -2034,7 +2178,7 @@ void add_source(App &a, const std::wstring &path, double at, int track) {
     s.id = a.next_id++;
     s.source_path = vi->path;
     s.info = vi;
-    s.is_sound = true;
+    s.kind = kStripSound;
     s.track = base;
     if (s.track >= int(a.project.tracks.size())) channel_slot(a, s.track);
     s.timeline_start = movie->timeline_start;
@@ -2090,6 +2234,44 @@ void import_paths(App &a, const std::vector<std::wstring> &paths, double at, int
   sync_preview(a);
   // 一次导入 = 一步撤消（多个文件也只是一次 sequencer.add_movies 的结果）。
   undo_push(a, L"导入条带");
+}
+
+// 新建文本条带，对应 Blender 的 sequencer.text_strip_add（sequencer_add.cc:2114-2145）。
+// 落位照它的 invoke：起点 = 当前帧（SEQPROP_STARTFRAME），通道 = 从猜中的那一格往上找
+// 第一条没被占用的（:363-393 sequencer_generic_invoke_xy_guess_channel +
+// find_unlocked_unmuted_channel）。长度走「没有内在时长的条带」那个默认值（:501 →
+// strip_add.cc:64 default_strip_length，它读 U.sequencer_default_strip_length，出厂 1.0 秒
+// —— 需求要 3 秒，所以这里写 3 秒，这是明知故犯的偏离，不是漏抄）。
+// 文本没有源文件：info / source_path 一律留空，画面由排版器现给（clip_source_size），
+// 时长由条带自己说。也正因为没有源，导入时烘「适配」缩放那一步对它不存在 —— 字号本来就是
+// 输出像素，再乘一次适配系数等于凭空放大。
+void add_text(App &a) {
+  Clip c;
+  c.id = a.next_id++;
+  c.kind = kStripText;
+  // 样式从 a.text_def 抄起：那一格就是「还没有文本带时面板改的地方」，两者必须是同一个
+  // 来源，否则用户在里面调半天、新建的带一个字都不认。
+  c.text = a.text_def;
+  c.label = L"文本";
+  int top = -1;
+  for (const Clip &o : a.project.clips) top = std::max(top, o.track);
+  c.track = top + 1;
+  // 起点对准播放头，并且落在帧格上：帧才是时间线上的刻度，导入走的是同一句换算。
+  c.timeline_start = a.frame_to_t(a.t_to_frame(a.project.playhead));
+  c.duration = a.frame_to_t(a.t_to_frame(3.0));
+  if (c.track >= int(a.project.tracks.size())) channel_slot(a, c.track);
+  const int64_t id = c.id;
+  a.project.clips.push_back(std::move(c));
+  if (trace_fp) {
+    wchar_t t[192];
+    swprintf(t, 192, L"add_text id=%lld track=%d start=%.6f dur=%.6f", (long long)id, top + 1,
+             a.project.clips.back().timeline_start, a.project.clips.back().duration);
+    trace(t);
+  }
+  select_only(a, id);
+  recompute_duration(a);
+  a.dirty |= kRLanes | kRViewport;
+  set_status(a, L"已添加文本条带：内容、字体、颜色在左侧「文本」组里改");
 }
 
 // ---------------------------------------------------------------- 编辑算子
@@ -2567,6 +2749,21 @@ void modal_update(App &a, double t) {
       dkey = std::clamp(double(df) * fd, a.modal.kmin, a.modal.kmax);
     }
   }
+  // 纵向位移整组共用一个夹过的值：限位对组里每条带取最紧的那一条
+  // （transform_convert_sequencer.cc:529-530 的 offset_clamp 夹的是位移，不是落点）。
+  // 逐条夹落点会让连接组贴底时影片和声带叠到同一通道，看起来像声带没了。
+  int dch_clamped = 0;
+  if (a.modal.kind == ModalState::Slide) {
+    int min_tr = kMaxChannels, max_tr = 0;
+    for (const Clip &r : a.modal.orig) {
+      min_tr = std::min(min_tr, r.track);
+      max_tr = std::max(max_tr, r.track);
+    }
+    const int dch =
+        int(std::lround((double(a.modal.y0) - double(a.mouse_y)) / double(channel_h(a))));
+    // 往下最多到组里最低那条贴底，往上最多到最高那条贴顶（0 基通道）。
+    dch_clamped = std::clamp(dch, -min_tr, kMaxChannels - 1 - max_tr);
+  }
   for (size_t i = 0; i < a.modal.orig.size(); ++i) {
     Clip &ref = a.modal.orig[i];
     Clip *c = find_clip(a, ref.id);
@@ -2597,16 +2794,11 @@ void modal_update(App &a, double t) {
         if (!row_locked) {
           // 纵向 = 换通道。Blender 把鼠标纵向像素差按「1 通道 = channel_h 像素」换算
           // （convertViewVec2D transform.cc:156-164），round 成整数通道
-          // （applySeqSlide transform_mode_edge_seq_slide.cc:133-134），再夹到
-          // [1, MAX_CHANNELS]（create_trans_seq_clamp_data:529-530 +
-          // Strip::channel_set strip_time.cc:630-633，MAX_CHANNELS=128 见
-          // SEQ_sequencer.hh:48）。本工程 track 是 0 基，所以区间是 [0, 127]。
-          const int dch =
-              int(std::lround((double(a.modal.y0) - double(a.mouse_y)) /
-                              double(channel_h(a))));
-          const int nt = std::clamp(ref.track + dch, 0, kMaxChannels - 1);
+          // （applySeqSlide transform_mode_edge_seq_slide.cc:133-134）。夹在整组那一笔
+          // （dch_clamped）已经做过，这里只落点：组内相对位置一格都不变。
           // 通道是扁平的一列（channels.cc:30-40），视频/声音条带都能落任何一条，
           // 落在还没建出来的通道上就把这条通道补出来。
+          const int nt = ref.track + dch_clamped;
           if (nt >= int(a.project.tracks.size())) channel_slot(a, nt);
           c->track = nt;
         }
@@ -2685,6 +2877,47 @@ void edge_pan_step(App &a, double now) {
   modal_update(a, x_time(a, mx));  // 视图变了 = 光标时刻变了，条带继续跟着抓取点
 }
 
+// 拖动提交时的让位 = Blender 出厂的 Overlap: Shuffle（strip_transform.cc:701-729）：
+// 被拖的这一组横着推到最近的一侧，已有条带一格时间都不动；推完还叠着才竖着升通道。
+// 导入/粘贴/复制不横推：Blender 那三处直接调 transform_shuffle_vertical
+// （sequencer_add.cc:703-707、sequencer_clipboard.cc:548-550），所以它们只升通道。
+static void slide_shuffle(App &a, const std::vector<Clip *> &moved) {
+  if (moved.empty()) return;
+  auto f0 = [&](const Clip &x) { return a.t_to_frame(x.timeline_start); };
+  auto f1 = [&](const Clip &x) { return a.t_to_frame(x.timeline_start + x.duration); };
+  auto in_group = [&](const Clip &x) {
+    for (const Clip *m : moved)
+      if (m->id == x.id) return true;
+    return false;
+  };
+  // shuffle_frame_offset_get（:130-158）对 Left、Right 各跑一遍不动点：推量只往一个方向
+  // 累积（min / max），这一轮没撞人就保持原值 ⇒ 循环必停。两侧合在一个循环里每轮清零重算
+  // 会「推到位→不重叠→归零→又重叠」来回振荡，停不下来。
+  // 相接不算相交（strips_overlap_at_offset:119-128）⇒ 推到位正好贴边，不留缝也不叠。
+  auto frame_offset = [&](int side) {
+    int64_t off = 0;
+    for (;;) {
+      const int64_t prev = off;
+      for (const Clip *s : moved) {
+        for (const Clip &o : a.project.clips) {
+          if (in_group(o) || o.track != s->track) continue;
+          if (f0(*s) + off >= f1(o) || f1(*s) + off <= f0(o)) continue;
+          off = side < 0 ? std::min(off, f0(o) - f1(*s)) : std::max(off, f1(o) - f0(*s));
+        }
+      }
+      if (off == prev) return off;
+    }
+  };
+  const int64_t off_l = frame_offset(-1);
+  const int64_t off_r = frame_offset(1);
+  const int64_t offset = (-off_l < off_r) ? off_l : off_r;  // 取近的那一侧，一样近取左（:168）
+  if (offset != 0) {
+    const double dt = double(offset) * a.frame_dur();
+    for (Clip *c : moved) move_clip_to(a, c, c->timeline_start + dt);
+  }
+  shuffle_vertical(a, moved);
+}
+
 void modal_end(App &a, bool commit) {
   if (a.modal.kind == ModalState::None) return;
   if (!commit) {  // 还原快照（Esc）。
@@ -2707,6 +2940,21 @@ void modal_end(App &a, bool commit) {
     a.tl.scroll_t = a.modal.edge.scroll0;
     set_status(a, L"已取消");
   } else {
+    // 让位发生在提交这一刻，拖动中允许暂时叠着：Blender 也是确认后才让位
+    // （special_aftertrans_update__sequencer，transform_convert_sequencer.cc:903）。
+    if (a.modal.kind == ModalState::Slide) {
+      std::vector<Clip *> moved;
+      for (const Clip &ref : a.modal.orig) {
+        // 锁定通道上的成员这一笔根本没动（modal_update 的 row_locked），它是挡路者不是
+        // 让位的一方：Blender 把锁定条带整个排除在变换数据之外（:88、:480）。
+        if (ref.track >= 0 && ref.track < int(a.project.tracks.size()) &&
+            a.project.tracks[ref.track].locked)
+          continue;
+        if (Clip *c = find_clip(a, ref.id)) moved.push_back(c);
+      }
+      slide_shuffle(a, moved);
+      recompute_duration(a);
+    }
     set_status(a, L"已提交");
     undo_push(a, a.modal.kind == ModalState::Slide
                      ? L"移动"
@@ -3128,7 +3376,7 @@ void keyframe_jump(App &a, bool next) {
 static bool strip_nudge(App &a, int dx, int dy) {
   if (!a.viewport.contains(float(a.mouse_x), float(a.mouse_y))) return false;
   Clip *c = props_clip(a);
-  if (!c || c->is_sound) return false;  // 声音条带没有画面，和它那只不存在的取景框一致
+  if (!c || c->kind == kStripSound) return false;  // 声音条带没有画面，和它那只不存在的取景框一致
   const bool ok_x = dx == 0 || prop_apply(a, kFOfsX, c, prop_value(a, kFOfsX, c) + dx, false);
   const bool ok_y = dy == 0 || prop_apply(a, kFOfsY, c, prop_value(a, kFOfsY, c) + dy, false);
   const bool moved = (dx != 0 || dy != 0) && (ok_x || ok_y);
@@ -3458,7 +3706,13 @@ void commit_edit(App &a, bool apply) {
   a.edit_text.clear();
   a.edit_ts = {};
   a.edit_anchor = -1;
-  if (apply && !text.empty()) prop_apply(a, id, props_clip(a), wcstod(text.c_str(), nullptr));
+  // 空串对数值框 = 「什么都没填」，等于放弃；对内容框它是一个合法值（清空就是让字消失）。
+  if (apply && (is_string_field(id) || !text.empty())) {
+    if (is_string_field(id))
+      text_content_set(a, text);
+    else
+      prop_apply(a, id, props_clip(a), wcstod(text.c_str(), nullptr));
+  }
   a.dirty = kRegionAll;
   undo_push(a, L"修改属性");
 }
@@ -3634,12 +3888,62 @@ bool retiming_delete_selected_keys(App &a) {
 
 // ---------------------------------------------------------------- 命令表
 
+// 种类按钮点下去 = 面板换到这一种，无条件、不拒绝（裁决：放开自由使用）。时间线里有这一种
+// 的带就顺手选中最先出现的那条，让面板落得到实物；一条都没有也照换 —— 文本那几行换个落点
+// 照样改得动（text_target 退到 a.text_def，新建的文本带从它抄起）。
+static void show_strip_kind(App &a, bool text) {
+  a.panel_kind = text ? kStripText : kStripMovie;
+  int64_t best = -1;
+  double best_start = 0.0;
+  for (const Clip &c : a.project.clips) {
+    if ((c.kind == kStripText) != text) continue;
+    if (best < 0 || c.timeline_start < best_start) {
+      best = c.id;
+      best_start = c.timeline_start;
+    }
+  }
+  if (best >= 0) select_only(a, best);
+  a.dirty = kRegionAll;
+}
+
+// 色块点下去 = 系统的选色框（comdlg32 的 ChooseColorW，OS 自带；不自己画一套色轮，
+// 一套色轮就是给颜色立界）。取消 = 什么都不改；确定 = 只写 RGB，alpha 一格不动 ——
+// alpha 是这一层的开关（排版器读它判关），开关归那一格百分数管，不由选色框代答。
+static void pick_text_color(App &a, int layer) {
+  float *dst = text_layer(text_target(a, props_clip(a)), layer);
+  static COLORREF custom[16] = {};  // 选色框要求这块自定义色板活得比一次调用长
+  CHOOSECOLORW cc = {};
+  cc.lStructSize = sizeof(cc);
+  cc.hwndOwner = a.hwnd;
+  cc.rgbResult = RGB(uint8_t(dst[0] * 255.0f + 0.5f), uint8_t(dst[1] * 255.0f + 0.5f),
+                     uint8_t(dst[2] * 255.0f + 0.5f));
+  cc.lpCustColors = custom;
+  cc.Flags = CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR;
+  if (!ChooseColorW(&cc)) return;
+  dst[0] = GetRValue(cc.rgbResult) / 255.0f;
+  dst[1] = GetGValue(cc.rgbResult) / 255.0f;
+  dst[2] = GetBValue(cc.rgbResult) / 255.0f;
+  a.dirty |= kRViewport | kRProps;
+  sync_preview(a);
+  undo_push(a, L"文本颜色");
+}
+
+// 「字体」下拉里的一条：条目是枚举出来的，所以命令号减基数就是那张表的第几行。
+static void pick_text_family(App &a, int index) {
+  const std::vector<std::wstring> &fams = txt::families();
+  if (index < 0 || size_t(index) >= fams.size()) return;
+  text_target(a, props_clip(a)).family = fams[size_t(index)];
+  set_status(a, L"字体：" + fams[size_t(index)]);
+  a.dirty |= kRViewport | kRProps;
+  sync_preview(a);
+  undo_push(a, L"文本字体");
+}
+
 void run_cmd(App &a, int cmd) {
   double fd = a.frame_dur();
   switch (cmd) {
     case kCmdImport: open_dialog(a); break;
     case kCmdExport: export_dialog(a); break;
-    case kCmdSettingsSave: settings_save(a); break;
     case kCmdSettingsReset: settings_reset(a); break;
     case kCmdFFmpegCheck: {
       std::wstring from;
@@ -3708,6 +4012,7 @@ void run_cmd(App &a, int cmd) {
       break;
     case kCmdRippleDelete: delete_selected(a, true); break;
     case kCmdDuplicate: duplicate_selected(a); break;
+    case kCmdAddText: add_text(a); break;
     case kCmdConnect: connect_selected(a); break;
     case kCmdDisconnect: disconnect_selected(a); break;
     case kCmdMute: mute_selected(a, true); break;
@@ -3898,7 +4203,16 @@ void run_cmd(App &a, int cmd) {
       layout(a);
       break;
     case kCmdScreenshot: screenshot_dialog(a); break;
-    default: break;
+    case kCmdPickVideoStrip: show_strip_kind(a, false); break;
+    case kCmdPickTextStrip: show_strip_kind(a, true); break;
+    // 三层的色块：下标就是 text_layer 的层号，和 Field 那十二格同一个数法。
+    case kCmdColorGlyph: pick_text_color(a, 0); break;
+    case kCmdColorOutline: pick_text_color(a, 1); break;
+    case kCmdColorBox: pick_text_color(a, 2); break;
+    default:
+      // 「字体」那一段：条目是枚举出来的，命令号减基数就是 txt::families() 的第几行。
+      if (cmd >= kCmdFontFirst) pick_text_family(a, cmd - kCmdFontFirst);
+      break;
   }
   (void)fd;
   // 一个算子 = 一步撤消（ED_undo_push 就挂在算子执行完的地方）。数据没动的命令——包括
@@ -4017,6 +4331,8 @@ const wchar_t *cmd_name(int cmd) {
     case kCmdDelete: return L"删除";
     case kCmdRippleDelete: return L"涟漪删除";
     case kCmdDuplicate: return L"复制条带";
+    // Add Text Strip（sequencer_add.cc:2119 的 ot->name = "Add Text Strip"）。
+    case kCmdAddText: return L"添加文本";
     // Copy / Paste（sequencer_edit.cc:3856/3877 的 ot->name）。Blender 只给粘贴挂
     // OPTYPE_UNDO，复制不改工程数据；这里不靠标记区分，数据没动的那一趟由
     // undo_push 的比对自己跳过。
@@ -4080,7 +4396,10 @@ const wchar_t *cmd_name(int cmd) {
     case kCmdToggleFullscreen: return L"全屏";
     case kCmdToggleStatusbar: return L"显示状态栏";
     case kCmdScreenshot: return L"保存截图…";
-    default: return L"";
+    case kCmdPickVideoStrip: return L"面板切到影像";
+    case kCmdPickTextStrip: return L"面板切到文本";
+    case kCmdColorGlyph: case kCmdColorOutline: case kCmdColorBox: return L"文本颜色";
+    default: return cmd >= kCmdFontFirst ? L"文本字体" : L"";
   }
 }
 
@@ -4151,15 +4470,34 @@ void build_menus(App &a) {
   m[kMAudio] = {{it(OutputFormat::audio_of(false), kCmdAudioAac),
                  it(OutputFormat::audio_of(true), kCmdAudioNone)}};
 
+  // ---- 文本组的「字体」-------------------------------------------------------------
+  // 家族由 DirectWrite 枚举（txt::families），所以条目数不写死；命令号 = 基数 + 表里的行号。
+  // 这里不排「本机没有的字体」，也不给名单设上限：名单多长是这台机器的字体表说了算。
+  {
+    const std::vector<std::wstring> &fams = txt::families();
+    // 当前家族只问 text_target 一次：按钮上的文字和这份名单里的勾读的是同一个值。
+    const std::wstring &cur = text_target(a, act).family;
+    std::vector<ui::Entry> fonts;
+    fonts.reserve(fams.size());
+    for (size_t i = 0; i < fams.size(); ++i) {
+      ui::Entry e;
+      e.name = fams[i];
+      e.id = kCmdFontFirst + int(i);
+      e.selected = fams[i] == cur;
+      fonts.push_back(std::move(e));
+    }
+    m[kMFont] = std::move(fonts);
+  }
+
   // ---- SEQUENCER_MT_retiming（I 键呼出，space_sequencer.py:1312-1323）--------------
   // Blender 这个菜单两条：添加关键帧、添加冻结帧滑动。冻结帧那条要先有「定格」这个
   // 条带形态（本工程还没有），所以只挂第一条。
   m[kMRetiming] = {{need_retiming(it(L"添加关键帧", kCmdRetimingKeyAdd))}};
 
   // ---- 顶栏「默认」--------------------------------------------------------------
-  // 保存/恢复都不改本次会话的任何数据：保存 = 把当前窗口状态、分隔条与格式参数写进设置
-  // 文件，恢复 = 删掉它，下次启动才回到出厂默认。
-  m[kMDefault] = {it(L"保存启动默认", kCmdSettingsSave), it(L"恢复启动默认", kCmdSettingsReset)};
+  // 保存不用点：关闭 exe 时整份落盘（main.cpp 的 WM_DESTROY 调 settings_save）。这里只留
+  // 恢复 = 删掉设置文件，下次启动才回到出厂默认，本次会话不受影响。
+  m[kMDefault] = {it(L"恢复启动默认", kCmdSettingsReset)};
 
   // ---- 顶栏「下载」--------------------------------------------------------------
   // 检测 = 只报现状（PATH 优先，其次主程序同目录，两处都要 ffmpeg.exe 和 ffprobe.exe 齐）；
@@ -4183,7 +4521,11 @@ void build_menus(App &a) {
   // ---- 右键上下文菜单 ---------------------------------------------------------------
   // 按需求只留这四条（其余条目已从菜单里撤下，算子本身和快捷键都还在：切分 X 之外的
   // Split、复制、连接/断开、删除、锁定/静音等仍由键盘和面板走）。
-  m[kMContext] = {{need_strip(it(L"切分", kCmdSplit)),
+  // 「添加文本」不在那条口径里：它是新建，不是对选中条带动手，所以不受 need_strip 管，
+  // 时间线空着也按得动。Blender 把它放在「添加」菜单（Add > Text Strip），需求要它出现在
+  // 条带区右键，就挂在这里 —— 右键落在哪都开这一个菜单，落点不是条带时也能建新条带。
+  m[kMContext] = {{it(L"添加文本", kCmdAddText), sep(),
+                   need_strip(it(L"切分", kCmdSplit)),
                    need_strip(it(L"复制条带", kCmdDuplicate)), sep(),
                    need_strip(it(L"连接条带", kCmdConnect)),
                    need_strip(it(L"断开条带", kCmdDisconnect))}};

@@ -108,6 +108,7 @@ enum MenuId : int {
   kMDownload,       // 顶栏「下载」：检测 FFmpeg / 下载 FFmpeg
   kMGrid,           // 顶栏「网络」：预览网格开 / 关
   kMPanel,          // 分界线右键：面板放左 / 放右 / 收起
+  kMFont,           // 文本组的「字体」：DirectWrite 枚举出来的家族，逐行用它自己的字体画
   kMenuCount
 };
 
@@ -140,12 +141,14 @@ enum ScrollZone : int {
   kSQNone = -99, kSQMinOut = -2, kSQMin = -1, kSQBar = 0, kSQMax = 1, kSQMaxOut = 2
 };
 
-// 左侧单页里的分组（kHitPanel | 这个值），自上而下就是需求列的顺序：
-// 格式（分辨率 X/Y/% + 宽高比 X/Y + 帧率）→ 变换 → 裁切 → 速度 → 帧范围 → 输出。
+// 左侧单页里的分组（kHitPanel | 这个值）。自上而下就是需求列的顺序：
+// 格式（分辨率 X/Y/% + 宽高比 X/Y + 帧率）→ 文本 → 变换 → 裁切 → 速度 → 帧范围 → 输出。
 // 组内行序取自 properties_output.py:109-132（RENDER_PT_format 的四个 column）与
 // properties_strip.py（变换、裁切）。裁切沿用 Blender 的 DEFAULT_CLOSED。
+// 文本排在枚举末尾而不是插在中间：panel_open[] 在设置文件里按**下标**存，插进来会把老
+// 用户的折叠状态错位。画在哪一组之后由 draw_props 的调用顺序决定，与这里的号无关。
 enum PanelId : int {
-  kPFormat = 0, kPXform, kPCrop, kPSpeed, kPRange, kPOutput, kPanelCount
+  kPFormat = 0, kPXform, kPCrop, kPSpeed, kPRange, kPOutput, kPText, kPanelCount
 };
 
 // ---------------------------------------------------------------- 命令 id
@@ -154,8 +157,8 @@ enum Cmd : int {
   kCmdNone = 0x100,
   // 文件（TOPBAR_MT_file 里只剩需求要的两个：打开、导出）
   kCmdImport, kCmdExport, kCmdQuit,
-  // 顶栏「设置」下拉（保存启动默认 / 恢复启动默认）
-  kCmdSettingsSave, kCmdSettingsReset,
+  // 顶栏「默认」下拉：只剩恢复启动默认；保存默认在关闭 exe 时自动做（settings_save）
+  kCmdSettingsReset,
   // 顶栏「下载」：先查 PATH / 主程序同目录，再决定报一句还是开跑（ffmpegget.cpp）
   kCmdFFmpegCheck, kCmdFFmpegDownload,
   // 编辑
@@ -163,6 +166,8 @@ enum Cmd : int {
   kCmdSelectLeftOfFrame, kCmdSelectRightOfFrame,
   // 时间线算子（sequencer.*）
   kCmdSplit, kCmdHardSplit, kCmdDelete, kCmdRippleDelete, kCmdDuplicate,
+  // 新建文本条带（sequencer.text_strip_add，sequencer_add.cc:2114-2145）
+  kCmdAddText,
   // 连接/断开片段（sequencer.connect / sequencer.disconnect，strip_connect.cc）
   kCmdConnect, kCmdDisconnect,
   kCmdMute, kCmdMuteUnselected, kCmdUnmute, kCmdLock, kCmdUnlock,
@@ -212,6 +217,15 @@ enum Cmd : int {
   // 窗口（TOPBAR_MT_window 里本工程真能做的三项：wm.window_fullscreen_toggle /
   // screen.show_statusbar / screen.screenshot）
   kCmdToggleFullscreen, kCmdToggleStatusbar, kCmdScreenshot,
+  // 面板顶部那两颗种类按钮：亮的那颗读 a.panel_kind（这里存的，不是从选中条带算的）。
+  // 点下去 = 面板换到那一种，时间线里有这一种的带就顺手选中最早的那条；没有也照换，
+  // 因为文本组的落点会退到 a.text_def（新建文本带继承的那份），不靠拒绝点击来骗人。
+  kCmdPickVideoStrip, kCmdPickTextStrip,
+  // 文本三层的色块：点下去开系统的选色框（comdlg32 的 ChooseColorW，OS 自带）。
+  // 下标就是 text_layer() 的层号：0 字形 / 1 轮廓 / 2 方框。
+  kCmdColorGlyph, kCmdColorOutline, kCmdColorBox,
+  // 「字体」下拉：家族是枚举出来的，条目数不写死，所以 id 从这个基数往上排。
+  kCmdFontFirst = 0x800,
 };
 
 // ---------------------------------------------------------------- 数值属性 id
@@ -239,10 +253,48 @@ enum Field : int {
   //   在 Transform 面板的 Mirror 一栏里成对出现（properties_strip.py:1036-1038）。
   //   strip.mute / strip.lock = SEQ_MUTE / SEQ_LOCK（:2674-2686）。
   kFFlipX, kFFlipY, kFMute, kFStripLock,
+  // 文本条带的样式（TextVars，见 types.h）。三段各自连成一片，判断都用区间：
+  //   粗体/斜体接在布尔那段后面，和镜像走同一个 prop_toggle；
+  //   内容是唯一的字符串行（回车换行、Ctrl+回车提交，点到框外也提交），不拖也不按数值解析；
+  //   再往后是数值档。字号..圆度不能插进 kFOfsX..kFRotation，那一段的 id 减一下标
+  //   就是动画曲线的通道号。
+  kFTextBold, kFTextItalic,
+  kFTextContent,
+  kFTextSize, kFTextLineSpacing, kFTextOutlineWidth, kFTextBoxMargin, kFTextBoxRoundness,
+  // 三层的颜色各四格：字形 / 轮廓 / 方框。RGB 按 0..255 显示、不透明度按百分数，
+  // 落进对象都折回 TextVars 那份 float[4] 的 0..1。轮廓和方框的 alpha 就是它们的开关
+  // （排版器读 alpha 判关，见 text.cpp），所以 0% = 这一层不出。
+  kFGlyphR, kFGlyphG, kFGlyphB, kFGlyphA,
+  kFOutlineR, kFOutlineG, kFOutlineB, kFOutlineA,
+  kFBoxR, kFBoxG, kFBoxB, kFBoxA,
 };
 
 // Field 里属于「点一下就翻转」的布尔项（数值拖动/文本输入那条路对它们没意义）。
-inline bool is_bool_field(int id) { return id >= kFFlipX && id <= kFStripLock; }
+inline bool is_bool_field(int id) { return id >= kFFlipX && id <= kFTextItalic; }
+// 文本带才答的行（内容 + 数值 + 颜色）。别的条带类型的对象里没有这份数据，
+// prop_apply 遇到它们就原样退回：一个字都不改，状态条说为什么。
+inline bool is_text_field(int id) { return id >= kFTextContent && id <= kFBoxA; }
+// 字符串行：缓冲区是内容本身，不是待 wcstod 的数字。
+inline bool is_string_field(int id) { return id == kFTextContent; }
+// 十二格颜色（三层 × 四通道）：id 连着排，行列由下面两个函数算，读写和画色块共用同一份换算。
+inline bool is_color_field(int id) { return id >= kFGlyphR && id <= kFBoxA; }
+// 文本那三层颜色的数组：0 字形 / 1 轮廓 / 2 方框。下标在 Cmd（kCmdColorGlyph…）和
+// Field（kFGlyphR…）两头都是这个顺序，所以它只在这里定义一次。
+inline float *text_layer(TextVars &t, int layer) {
+  return layer == 0 ? t.color : (layer == 1 ? t.outline_color : t.box_color);
+}
+inline const float *text_layer(const TextVars &t, int layer) {
+  return text_layer(const_cast<TextVars &>(t), layer);
+}
+// 一格颜色 = 哪一层、哪个通道、界面上按几档显示（alpha 是百分数，其余 0..255；对象里都是 0..1）。
+inline void text_color_at(int id, int *layer, int *ch, double *scale) {
+  const int d = id - kFGlyphR;
+  *layer = d / 4;
+  *ch = d % 4;
+  *scale = *ch == 3 ? 100.0 : 255.0;
+}
+// 颜色行的行号（0 字形 / 1 轮廓 / 2 方框）：面板画那一行、选色框改那一层，都问它。
+inline int text_color_row(int id) { return (id - kFGlyphR) / 4; }
 
 struct PropSpec {
   double soft_min, soft_max;  // Button::softmin/softmax
@@ -411,8 +463,16 @@ struct App {
   // 面板每一组标题左边那颗小三角：true=展开、false=只留标题。Blender 的裁切面板写的是
   // bl_options = {'DEFAULT_CLOSED'}（properties_strip.py:118），但需求把「裁切：左/右/顶/底」
   // 列成左侧必须有的一块内容，折叠起来等于没有，所以这里默认展开。
-  // 关掉 exe 时这份状态会进设置文件的 panel 行（见 settings_save_collapse）。
-  bool panel_open[kPanelCount] = {true, true, true, true, true, true};
+  // 关掉 exe 时这份状态会进设置文件的 panel 行（见 settings_save）。
+  bool panel_open[kPanelCount] = {true, true, true, true, true, true, true};
+  // 面板此刻演的是哪一种（kStripText 或别的）。亮的那颗按钮、哪几组出现、文本行落到哪份
+  // TextVars 三处都只读这一格。写它的是两笔：种类按钮按下去无条件换，选中一条带时选中也
+  // 把它写成那条带的种类 —— 两个来源写的是同一个意思，不是同一个值存两处。
+  int panel_kind = kStripMovie;
+  // 文本参数的模板：面板演文本这一种、而选中的又不是文本带时，文本那几行写的就是这一份；
+  // 新建的文本带从它抄起（见 ops.cpp 的 add_text）。它是默认值而不是工程数据，所以不进
+  // 撤消快照，但关 exe 时进设置文件的 text 行（见 settings.cpp），活得过重启。
+  TextVars text_def;
 
   // 开关（对齐 RNA）。吸附与叠加层的分项开关按需求不做：吸附候选集固定为设计稿那两条
   // 规则（见 snap_time），时间线网格与条带文字恒画，所以这里只剩区域/显示本身的开关。
@@ -537,6 +597,10 @@ double x_time(const App &a, float x);
 Rect fit_box(const App &a);
 Rect view_rect(const App &a);
 Rect clip_base_rect(const App &a, const Clip &c, const Rect &box);
+// 条带那一幅「源画面」有多大，单位 = 输出像素：影片问 probe，文本问排版器。
+// 定画面尺寸、摆取景框四角、把裁切量换成纹素坐标三处都读这里 —— 源尺寸在别处再算一遍
+// 就是两个所有者，会出现「框和画各走各的」。
+void clip_source_size(const App &a, const Clip &c, int *w, int *h);
 // 1 输出像素在屏幕上占多少像素，横竖各一个（画面上那两行位移的单位是「格式面板的分辨率」）。
 // 预览里画画面、算取景框四角、把鼠标拖动换成位移三处都读它，所以只有这一个算法。
 struct ScreenPx {
@@ -577,7 +641,7 @@ bool redo_step(App &a);
 
 // ---------------------------------------------------------------- 数据
 Clip *find_clip(App &a, int64_t id);
-Clip *props_clip(App &a);            // 面板作用的条带（活动条带，退化为播放头下的条带）
+Clip *props_clip(const App &a);      // 面板作用的条带（活动条带，退化为播放头下的条带）
 bool clip_selected(const App &a, int64_t id);
 std::vector<Clip *> selected_clips(App &a);
 Clip *clip_at(const App &a, double t);
@@ -632,8 +696,17 @@ double snap_strip_move(App &a, const Clip &c, double new_start);
 bool ctrl_held();
 bool shift_held();  // 同上（框选要不要并入已有选择，由框这个对象在落地那一刻自己问）
 const PropSpec &prop_spec(int id);
-double prop_value(App &a, int id, const Clip *c);
-std::wstring prop_text(App &a, int id, const Clip *c);
+double prop_value(App &a, int id, Clip *c);
+std::wstring prop_text(App &a, int id, Clip *c);
+// 文本那几行落到哪一份 TextVars：选中的是文本带就是它自己，否则是 a.text_def。
+// 读、写、画色块三处都只经过这里 —— 面板演文本这一种时没有「带」可写是常态（时间线里
+// 还没有文本带），落点必须由这一处回答，不许每行自己判一遍。
+TextVars &text_target(App &a, Clip *c);
+// 字符串行的读数（只有内容那一行）。它和 prop_text 是两个出口，不是一个值的两处写法：
+// prop_text 的产物是「一个数格式化后的串」，把整段文字塞进那条路要先编一个数出来。
+std::wstring prop_string(App &a, Clip *c);
+// 内容那一行的写入口，和 prop_string 成对（prop_apply 收 double，装不下宽字符串）。
+void text_content_set(App &a, const std::wstring &s);
 // 改一个属性。pair = 是否遵守 XY 成对锁定：预览里拖取景框是二维操作，两轴由调用方
 // 自己写对，所以它传 false；面板输入框/滑块拖拽传 true（默认）。
 bool prop_apply(App &a, int id, Clip *c, double v, bool pair = true);
@@ -659,6 +732,8 @@ void add_source(App &a, const std::wstring &path, double at = -1.0, int track = 
 // 单位是「这一次新增的一组」，所以影片和它的声带永远停在同一时刻。
 void shuffle_vertical(App &a, const std::vector<Clip *> &fresh);
 void import_paths(App &a, const std::vector<std::wstring> &paths, double at = -1.0, int track = -1);
+// 新建文本条带（sequencer.text_strip_add）：起点对准播放头、落在最上面的空通道、默认 3 秒。
+void add_text(App &a);
 void split_selected(App &a, bool hard);
 void delete_selected(App &a, bool ripple);
 void duplicate_selected(App &a);

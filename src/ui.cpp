@@ -143,8 +143,10 @@ static float text_y(const Rect &area) { return area.y + (area.h - btheme::font_p
 
 // 编辑态的选区底色 + 光标。两者都按「画出来的那串字」的左边界换算，所以 but_num 的
 // 居中排版和 but_text 的左对齐排版共用这一段。
+// show_caret：多行框按行调用，光标只属其中一行。其余行仍要画选区（跨行的选区在中间那些行
+// 是整行选中），但竖条只能有一根 —— 夹到行首/行尾的假光标会在每一行都立一根。
 static void draw_caret_sel(Render2D &r, const Rect &area, const std::wstring &text, float tx,
-                           const TextSel &ts) {
+                           const TextSel &ts, bool show_caret = true) {
   const float pad = 0.25f * area.h;
   const int n = int(text.size());
   auto edge = [&](int i) {
@@ -155,7 +157,8 @@ static void draw_caret_sel(Render2D &r, const Rect &area, const std::wstring &te
   if (hi > lo)
     r.rect({edge(lo), area.y + pad, edge(hi) - edge(lo), area.h - pad * 2.0f},
            Color{cur.r, cur.g, cur.b, 0x55});
-  r.rect({edge(ts.caret), area.y + pad, btheme::pixelsize, area.h - pad * 2.0f}, cur);
+  if (show_caret)
+    r.rect({edge(ts.caret), area.y + pad, btheme::pixelsize, area.h - pad * 2.0f}, cur);
 }
 
 // 指针 x 落在哪个字符边界上：取距离最近的那一个（0 = 串首，len = 串尾）。
@@ -172,6 +175,41 @@ int text_index_at(Render2D &r, const std::wstring &s, float text_x, float x) {
     }
   }
   return best;
+}
+
+// 一行的区间就是「到下一个 \n 之前」：不做自动折行，回车才是换行（和排版器同一个口径）。
+std::vector<TextLine> text_lines(const std::wstring &s) {
+  std::vector<TextLine> out;
+  size_t b = 0;
+  while (true) {
+    const size_t n = s.find(L'\n', b);
+    out.push_back({int(b), int(n == std::wstring::npos ? s.size() : n)});
+    if (n == std::wstring::npos) break;
+    b = n + 1;
+  }
+  return out;
+}
+
+static std::vector<std::wstring> split_lines(const std::wstring &s) {
+  std::vector<std::wstring> out;
+  for (const TextLine &l : text_lines(s)) out.push_back(s.substr(l.begin, l.end - l.begin));
+  return out;
+}
+
+// 多行框的落点：先用 y 定第几行，再在那一行里用 x 定列，最后换回整串的扁平下标
+// （光标和选区存的始终是扁平下标，编辑、提交、撤消都只认那一个数）。
+// 落在行尾之后 = 夹到行尾；\n 自己算左边那一行的末尾，不算下一行的开头。
+int text_index_at(Render2D &r, const std::wstring &s, const Rect &cell, float text_x, float line_h,
+                  float x, float y) {
+  const std::vector<std::wstring> lines = split_lines(s);
+  int line = int((y - cell.y) / line_h);
+  line = std::clamp(line, 0, int(lines.size()) - 1);
+  size_t base = 0;
+  for (int i = 0; i < line; ++i) base += lines[size_t(i)].size() + 1;
+  const std::wstring &ln = lines[size_t(line)];
+  int col = text_index_at(r, ln, text_x, x);
+  if (col == int(ln.size()) && base + ln.size() + 1 <= s.size()) ++base;  // 落在换行符那一格
+  return int(base) + col;
 }
 
 Rect but_num(Render2D &r, Block &blk, int id, const Rect &area, const wchar_t *label,
@@ -208,7 +246,6 @@ Rect but_num(Render2D &r, Block &blk, int id, const Rect &area, const wchar_t *l
   it.id = id;
   it.type = Num;
   it.text_x = tx;
-  it.text_w = tw;
   it.softmin = softmin;
   it.softmax = softmax;
   it.step = step;
@@ -283,22 +320,46 @@ Rect but_pulldown(Render2D &r, Block &blk, int id, const Rect &area, const std::
 }
 
 Rect but_text(Render2D &r, Block &blk, int id, const Rect &area, const std::wstring &text,
-              bool active, const TextSel *ts) {
+              bool active, const TextSel *ts, float line_h) {
   // wcol_text：底 0x1d1d1d，编辑态 0x181818（userdef_default_theme.c:70-72）。
   // 文字左对齐；编辑态画选区与光标（widget_text_cursor 0x71a8ff）。
   const btheme::Wcol &w = btheme::wcol_text;
   emboss(r, area, w, active);
-  const float pad = 0.25f * area.h;
-  float x = area.x + pad;
-  if (ts) draw_caret_sel(r, area, text, x, *ts);
-  r.text(x, text_y(area), text, btheme::font_px, active ? w.text_sel : w.text);
+  // 多行框：串里的 \n 各占一行，行高由调用方给（面板那一行的格高）。左右边距跟着行高而不是
+  // 格子高，否则三行的框会在左边空出一大截。
+  const float lh = line_h > 0.0f ? line_h : area.h;
+  const float x = area.x + 0.25f * lh;
+  const Color tc = active ? w.text_sel : w.text;
+  std::vector<std::wstring> lines;
+  if (line_h > 0.0f)
+    lines = split_lines(text);
+  else
+    lines.push_back(text);
+  r.push_clip(area);  // 正在敲、行数顶出格子的那几行裁在框内，不爬到下一行上去
+  float yy = area.y;
+  size_t base = 0;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const Rect ln{area.x, yy, area.w, lh};
+    const int len = int(lines[i].size());
+    if (ts) {
+      const int c = std::clamp(ts->caret - int(base), 0, len);
+      const int s = std::clamp(ts->sel - int(base), 0, len);
+      // 行尾那个换行符算在这一行的末尾：光标停在它上面时归这一行，不归下一行的行首。
+      const bool here = ts->caret >= int(base) && ts->caret <= int(base + len);
+      draw_caret_sel(r, ln, lines[i], x, {c, s}, here);
+    }
+    r.text(x, text_y(ln), lines[i], btheme::font_px, tc);
+    base += size_t(len) + 1;  // +1 = 这一行末尾那个换行符也占一个字符位
+    yy += lh;
+  }
+  r.pop_clip();
   Item it;
   it.rect = area;
   it.id = id;
   it.type = Text;
   it.active = active;
   it.text_x = x;
-  it.text_w = r.text_width(text, btheme::font_px);
+  it.line_h = line_h;
   blk.add(it);
   return area;
 }
@@ -371,6 +432,26 @@ void Popover::open(Render2D &r, int menu, float x, float y, const Rect &bounds) 
   stack_.clear();
   stack_.push_back(lv);
   layout_level(stack_.back(), x, y);
+  // 名单里有当前值（带勾那一行）就打开停在它身上：名单比窗口高时，勾否则在屏幕外，
+  // 「显示选中状态」就等于没显示。
+  Level &root = stack_.back();
+  const auto &entries = (*table_)[root.menu];
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (!entries[i].selected) continue;
+    const float mid = root.rows[i].y + root.rows[i].h * 0.5f;
+    root.scroll += mid - (root.rect.y + root.rect.h * 0.5f);
+    layout_level(root, root.rect.x, root.rect.y);
+    break;
+  }
+}
+
+bool Popover::on_wheel(short delta) {
+  if (stack_.empty() || !table_) return false;
+  Level &lv = stack_.back();
+  const float before = lv.scroll;
+  lv.scroll -= float(delta) / WHEEL_DELTA * 3.0f * btheme::u(1.0f);
+  layout_level(lv, lv.rect.x, lv.rect.y);
+  return lv.scroll != before;
 }
 
 // 面板宽 = max(UI_MENU_WIDTH_MIN = 9*unit, 最宽条目)；高 = 各条目之和 + 2*UI_MENU_PADDING。
@@ -379,11 +460,15 @@ void Popover::layout_level(Level &lv, float x, float y) const {
   const auto &entries = (*table_)[lv.menu];
   const float pad = float(int(0.2f * btheme::u(1.0f)));   // UI_MENU_PADDING
   const float ipad = 0.25f * btheme::u(1.0f);             // 条目内边距
+  // 有一行带勾，整份菜单都让出这一列：文字左缘对齐，勾落在空出来的那一格里。
+  bool any_selected = false;
+  for (const Entry &e : entries) any_selected |= e.selected;
+  lv.icon_w = any_selected ? btheme::icon_size() + ipad : 0.0f;
   float widest = 0.0f, h = pad;
   for (const Entry &e : entries) {
     float w = ipad * 2.0f;
     if (!e.sep) {
-      w += float(measure(e.name));
+      w += float(measure(e.name)) + lv.icon_w;
       if (!e.shortcut.empty()) w += float(measure(e.shortcut)) + btheme::icon_size();
       if (e.submenu >= 0) w += 6.0f * btheme::scale + 10.0f * btheme::scale;  // 箭头 + 余量
     }
@@ -391,12 +476,17 @@ void Popover::layout_level(Level &lv, float x, float y) const {
     h += row_height(e);
   }
   float w = std::max(btheme::u(9.0f), widest);
+  // 名单比客户区高时面板只占客户区那么高：多出来的行靠 scroll 翻进翻出，
+  // 面板盒子（命中与裁剪都认它）始终是屏幕上看得见的那一块。
+  const float vis_h = std::min(h, bounds_.h);
   float rx = x, ry = y;
   if (rx + w > bounds_.x + bounds_.w) rx = std::max(bounds_.x, bounds_.x + bounds_.w - w - 1.0f);
-  if (ry + h > bounds_.y + bounds_.h) ry = std::max(bounds_.y, bounds_.y + bounds_.h - h - 1.0f);
-  lv.rect = {rx, ry, w, h};
+  if (ry + vis_h > bounds_.y + bounds_.h)
+    ry = std::max(bounds_.y, bounds_.y + bounds_.h - vis_h - 1.0f);
+  lv.rect = {rx, ry, w, vis_h};
+  lv.scroll = std::clamp(lv.scroll, 0.0f, std::max(0.0f, h - vis_h));
   lv.rows.clear();
-  float cy = ry + pad;
+  float cy = ry + pad - lv.scroll;
   for (const Entry &e : entries) {
     lv.rows.push_back({rx + pad * 0.5f, cy, w - pad, row_height(e)});
     cy += row_height(e);
@@ -523,6 +613,12 @@ int Popover::on_key(UINT vk) {
       if (!entries[size_t(i)].sep && entries[size_t(i)].enabled) break;
     }
     top.hover = i;
+    // 方向键走到的那一行翻进可见区，不然高亮在屏幕外等于没高亮。
+    const Rect &hr = top.rows[size_t(i)];
+    if (hr.y < top.rect.y) top.scroll -= top.rect.y - hr.y;
+    else if (hr.y + hr.h > top.rect.y + top.rect.h)
+      top.scroll += hr.y + hr.h - (top.rect.y + top.rect.h);
+    layout_level(top, top.rect.x, top.rect.y);
     // 方向键移到子菜单行 = 打开它并高亮其第一项（BUTTON_ACTIVATE_OPEN）。
     expand_hovered(true);
     return -2;  // 已处理，无命令
@@ -538,6 +634,8 @@ void Popover::draw(Render2D &r) {
     const auto &entries = (*table_)[lv.menu];
     const btheme::Wcol &wb = btheme::wcol_menu_back;
     const float rad = btheme::radius(wb.roundness);
+    // 翻出去的行不画在面板盒子外（盒子就是屏幕上看得见的那一块）。
+    r.push_clip(lv.rect);
     r.rrect(lv.rect, rad, wb.inner);
     r.rring(lv.rect, rad, btheme::pixelsize, wb.outline);
     const float pad = 0.25f * btheme::u(1.0f);
@@ -558,9 +656,17 @@ void Popover::draw(Render2D &r) {
         tc = btheme::wcol_menu_item.text_sel;
       }
       float ty = row.y + (row.h - btheme::font_px) * 0.5f;
-      float tx = row.x + pad;
+      float tx = row.x + pad + lv.icon_w;
       if (!e.enabled)
         tc = btheme::mix(btheme::wcol_menu_item.text, btheme::wcol_menu_back.inner, 0.5f);
+      if (e.selected) {
+        // 勾（ICON_CHECKMARK 的两笔），画在让出来的那一列里，颜色跟着条目走。
+        const float s = btheme::icon_size();
+        const float bx = row.x + pad, by = row.y + (row.h - s) * 0.5f;
+        const float t = std::max(1.0f, btheme::pixelsize) * 1.4f;
+        r.line_seg(bx + s * 0.15f, by + s * 0.55f, bx + s * 0.40f, by + s * 0.80f, t, tc);
+        r.line_seg(bx + s * 0.40f, by + s * 0.80f, bx + s * 0.85f, by + s * 0.20f, t, tc);
+      }
       r.text(tx, ty, e.name, btheme::font_px, tc);
       if (!e.shortcut.empty()) {
         // 快捷键右对齐、暗 50%（BUT_INACTIVE 状态）。
@@ -575,6 +681,7 @@ void Popover::draw(Render2D &r) {
               row.x + row.w - pad + s * 0.6f, cy, tc);
       }
     }
+    r.pop_clip();
   }
 }
 

@@ -50,6 +50,10 @@ double retiming_content(const Clip &c) {
 }
 
 bool retiming_is_allowed(const Clip &c, double frame_dur) {
+  // Blender 的白名单里没有 TEXT（strip_retiming.cc:161-168）：文本带不是一段素材，
+  // 没有「源里还剩多少秒」可以压。这一格不能只靠 info 为空蒙对 —— 哪天文本带上挂了
+  // 什么时长，变速就会自己活过来。
+  if (c.kind == kStripText) return false;
   return frame_dur > 0.0 && retiming_content(c) / frame_dur > 1.0;
 }
 

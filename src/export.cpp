@@ -6,6 +6,8 @@
 #include <numeric>
 #include <cstdio>
 
+#include "text.h"
+
 // ops.cpp 里的 VSE_TRACE 落盘函数（export.cpp 不引 app.h，避免循环包含）。
 namespace app {
 void trace(const std::wstring &s);
@@ -136,13 +138,13 @@ long long tick_tail(double d, double b, long long n_out, long long n_last) {
 // 命令行的上限是 32767 个字符（含所有参数），一张逐帧的图轻松破万，所以留一半给别的参数。
 constexpr size_t kInlineGraphLimit = 14000;
 
-std::wstring temp_text_path(const wchar_t *stem) {
+std::wstring temp_path(const std::wstring &stem, const wchar_t *ext) {
   wchar_t dir[MAX_PATH] = {};
   DWORD n = GetTempPathW(MAX_PATH, dir);
   // 不用 swprintf 拼：这里的 %s 会按窄字符串解析 wchar_t*，路径在第一个 0 字节处截断，
   // 只剩一个「C」。
-  if (!n || n > MAX_PATH - 1) return std::wstring(stem) + L".txt";
-  return std::wstring(dir) + stem + L"_" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+  if (!n || n > MAX_PATH - 1) return std::wstring(stem) + ext;
+  return std::wstring(dir) + stem + L"_" + std::to_wstring(GetCurrentProcessId()) + ext;
 }
 
 bool write_text_file(const std::wstring &path, const std::wstring &text) {
@@ -203,10 +205,15 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
     if (c.track < 0 || c.track >= int(p.tracks.size())) continue;
     if (p.tracks[c.track].muted) continue;  // 通道静音（render.cc:2240-2243）
     if (c.muted) continue;  // SEQ_MUTE（sequencer_edit.cc:1366）：条带不参与渲染
-    if (c.is_sound) {
+    if (c.kind == kStripSound) {
       // 声带不进画面：collection_filter_rendered_strips 第一件事就是否掉 STRIP_TYPE_SOUND
       // （sequencer/intern/iterator.cc:223-225）⇒ 它只贡献音频，画面里那一格是黑的。
       if (!c.info || !c.info->has_audio) continue;  // 没有 bSound 的 SOUND 条带不发声（sound.cc:945-951）
+    } else if (c.kind == kStripText) {
+      // 文本没有媒体文件：它的「画面」由 DirectWrite 现排在画布尺寸上（见 text.cpp），
+      // 导出与预览调同一个函数、传同一个画布宽 ⇒ 拿到的是同一张位图（缓存里同一个号），
+      // 这里没有 info 可查，也不许在这里查。没有墨迹（空内容、只有空格、排版失败）就没有画面。
+      if (!txt::bitmap(c.text, p.fmt.width)) continue;
     } else {
       if (!c.info || c.info->width <= 0 || c.info->height <= 0) return fail(L"片段缺少媒体信息");
     }
@@ -307,23 +314,36 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
 
   // 同一个源文件只开一路解码：被切成几份就 split/asplit 出几份。不这么做的话每个 trim 都是
   // 从文件头重新解码一遍，底带被上面几条短带切碎时导出会慢得离谱。
+  // 文本的「源文件」是排版器那张位图落成的临时 PNG：一只位图一个号（样式一改就是新号），
+  // 字样相同的多条带、同一条带切出的多段共用同一只文件、同一路 split，文件只在头一次遇到时写。
   std::vector<std::wstring> srcs;
   std::vector<int> vuse, ause;
+  std::vector<bool> src_text;
   std::map<std::wstring, int> src_of;
   for (auto &ls : seg_layers)
     for (Layer &ly : ls) {
-      auto it = src_of.find(ly.c.source_path);
+      const txt::Bitmap *bm =
+          ly.c.kind == kStripText ? txt::bitmap(ly.c.text, p.fmt.width) : nullptr;
+      std::wstring key = ly.c.source_path;
+      if (bm) key = temp_path(L"vse_text_" + std::to_wstring(bm->serial), L".png");
+      auto it = src_of.find(key);
       if (it == src_of.end()) {
-        it = src_of.emplace(ly.c.source_path, int(srcs.size())).first;
-        srcs.push_back(ly.c.source_path);
+        it = src_of.emplace(key, int(srcs.size())).first;
+        srcs.push_back(key);
         vuse.push_back(0);
         ause.push_back(0);
+        src_text.push_back(bm != nullptr);
+        if (bm) {
+          if (!txt::save_png(*bm, key))
+            return fail(L"无法写入文本位图 " + txt::last_error());
+          cmd->temp_files.push_back(key);
+        }
       }
       ly.src = it->second;
       // 画面切片按源分组，声带切片另起一套计数：一条影片的图像和它的音轨是两条不同的
       // 条带，各自占一路 split/asplit，但共用同一个 -i 输入。
-      if (!ly.c.is_sound) ly.nth = vuse[ly.src]++;
-      if (want_audio && ly.c.is_sound) {
+      if (ly.c.kind != kStripSound) ly.nth = vuse[ly.src]++;
+      if (want_audio && ly.c.kind == kStripSound) {
         ly.uses_audio = true;
         ly.nth_a = ause[ly.src]++;
       }
@@ -361,9 +381,15 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
     const double dur = c.duration;
     // 条带走 dur 秒，源要吃 dur×spd 秒（spd = 这一段的段速，见 retiming.h）。
     const double spd = retiming_speed_at(c, c.duration);
-    const double sfps = c.info->src_fps();
-
-    long long sw = c.info->width, sh = c.info->height;
+    // 这一路的「源坐标」四个量：图像层从解码信息读，文本层从它自己的源读 —— 那张位图被
+    // -loop 1 铺成工程帧率的帧流，每一格 tick 交的就是这一张图，所以帧率=工程帧率、
+    // 段速=1（文本没有内在时长，变速那把键本来就拒绝它）、源内左缘=0、帧号=tick 号。
+    // 这四个量定死之后，下面的裁切/缩放/旋转/摆放/逐帧采样一条算式都不分叉。
+    const bool text = c.kind == kStripText;
+    const txt::Bitmap *bm = text ? txt::bitmap(c.text, p.fmt.width) : nullptr;
+    const double sfps = text ? fps : c.info->src_fps();
+    const double src_in = text ? 0.0 : c.source_in;
+    long long sw = text ? bm->w : c.info->width, sh = text ? bm->h : c.info->height;
     long long cl = clampi(c.crop_l, 0, std::max<long long>(0, sw - 16));
     long long cr = clampi(c.crop_r, 0, std::max<long long>(0, sw - 16 - cl));
     long long ct = clampi(c.crop_t, 0, std::max<long long>(0, sh - 16));
@@ -374,13 +400,15 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
     // trim 的判据是 pts>=start，把边界写在某只样本的 pts 上，谁进谁出就由 µs 级舍入决定
     // （实测：原点打印成六位小数一旦向上舍入，导出的第 0 帧就是源的第 1 帧）。
     // 帧号是整数，且解码流的第 0 帧就是源内第 0 帧 ⇒ 容器原点在这道门不必出现（它属于 seek）。
-    const double a = c.source_in * sfps;                          // 切片左缘的源帧坐标
+    const double a = src_in * sfps;                               // 切片左缘的源帧坐标
     const long long n_out = std::max<long long>(1, std::llround(dur * fps));  // 这一段几只 tick
-    const int64_t f0 = c.info->src_frame(c.source_in);
+    const int64_t f0 = text ? 0 : c.info->src_frame(src_in);
     // 末 tick 要的那只 = 预览在同一 tick 上给的同一只；end_frame 排他 ⇒ +1。
     // 至少留一帧：段长不足一只源帧时（源帧率低于工程帧率）也不许切空。
+    // 文本那一路的流就是按工程帧率铺的 n_out 只 ⇒ 不必问解码器，帧号即 tick 号。
     const int64_t f1 =
-        std::max(f0 + 1, c.info->src_frame(c.source_in + double(n_out - 1) * spd / fps) + 1);
+        text ? f0 + n_out
+             : std::max(f0 + 1, c.info->src_frame(src_in + double(n_out - 1) * spd / fps) + 1);
     // 左缘没踩在整数帧格上时的那点余量，和一 tick 走几只源帧 —— tick_place 的两个自变量。
     const double off = a - double(f0), per_tick = spd * sfps / fps;
     // 导出这一路对「第 k 格交第几只源帧」的全部答案就是这几个整数/比率，落一行让预览那一路
@@ -470,7 +498,7 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
       if (rot_anim) eang.assign(nn, 0.0);
       for (size_t k = 0; k < nn; k++) {
         const XformAt x = xform_at(c, p.fmt, c.timeline_start +
-                                             ((double(f0) + double(k)) / sfps - c.source_in) / spd);
+                                             ((double(f0) + double(k)) / sfps - src_in) / spd);
         kxv[k] = x.scale_x > 0 ? x.scale_x : 1.0;
         kyv[k] = x.scale_y > 0 ? x.scale_y : 1.0;
         const double r = x.rotation * 3.14159265358979 / 180.0;
@@ -531,8 +559,9 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
     const std::wstring place = tick_place(off, per_tick, fps, n_out);
     // 窗里超出文件的那几只并不存在：补帧最多补到文件的最后一只，再往后的格是底色
     // （预览在那儿同样解不出帧）。
-    const long long n_cap =
-        std::min<long long>(f1, c.info->frame_count > 0 ? c.info->frame_count : f1) - 1 - f0;
+    const long long n_cap = std::min<long long>(
+                                f1, text || c.info->frame_count <= 0 ? f1 : c.info->frame_count) -
+                                1 - f0;
     const long long tail = tick_tail(off, per_tick, n_out, n_cap);
     const std::wstring pad =
         tail > 0 ? L",tpad=stop=" + std::to_wstring(tail) + L":stop_mode=clone" : L"";
@@ -616,7 +645,7 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
     // iterator.cc:223-225 先否掉 STRIP_TYPE_SOUND，声音侧 sound.cc:945-951 只收带
     // bSound 的那几条）。所以「一段里只有声带」是黑画面 + 有声音，而不是空段。
     std::vector<size_t> vids, snds;
-    for (size_t j = 0; j < ls.size(); j++) (ls[j].c.is_sound ? snds : vids).push_back(j);
+    for (size_t j = 0; j < ls.size(); j++) (ls[j].c.kind == kStripSound ? snds : vids).push_back(j);
     const double seg_dur = seg1 - seg0;
     if (vids.empty() && snds.empty()) {  // 这一段画面上没人 ⇒ 黑帧（帧范围头部、条带之间的空隙都落在这里）
       add_black(seg_dur, L"gap" + tag);
@@ -744,12 +773,11 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
   // 用 ffmpeg 9 的 -/filter_complex（从文件读取该参数的值）。老写法
   // -filter_complex_script 在 9.0.2 已不存在。
   cmd->graph = graph;
-  cmd->graph_file.clear();
-  std::wstring graph_arg;
+  std::wstring graph_arg, graph_file;
   if (graph.size() > kInlineGraphLimit) {
-    cmd->graph_file = temp_text_path(L"vse_ffgraph");
-    if (!write_text_file(cmd->graph_file, graph))
-      return fail(L"无法写入滤镜图临时文件：" + cmd->graph_file);
+    graph_file = temp_path(L"vse_ffgraph", L".txt");
+    if (!write_text_file(graph_file, graph)) return fail(L"无法写入滤镜图临时文件：" + graph_file);
+    cmd->temp_files.push_back(graph_file);
     graph_arg = L"-/filter_complex";
   } else {
     graph_arg = L"-filter_complex";
@@ -757,15 +785,20 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
 
   cmd->args.clear();
   cmd->args = {L"-v", L"error", L"-nostdin", L"-y", L"-hide_banner"};
-  for (const std::wstring &path : srcs) {
+  for (size_t s = 0; s < srcs.size(); s++) {
+    // 文本那一路给的是一张图，不是影片：-loop 1 把它铺成无限的，-framerate 决定每只复制帧
+    // 占多少时间 —— 工程帧率，于是「第 n 只复制帧」正好就是时间线的第 n 格 tick，下面
+    // trim 的帧号才和 tick_place 的反解对得上。
+    if (src_text[s])
+      cmd->args.insert(cmd->args.end(), {L"-loop", L"1", L"-framerate", fr});
     cmd->args.push_back(L"-i");
-    cmd->args.push_back(path);
+    cmd->args.push_back(srcs[s]);
   }
   cmd->args.push_back(graph_arg);
-  cmd->args.push_back(cmd->graph_file.empty() ? graph : cmd->graph_file);
+  cmd->args.push_back(graph_file.empty() ? graph : graph_file);
   // 图进了文件就再看不到了（导出后删掉），所以把原文也落一行日志。
-  if (!cmd->graph_file.empty()) {
-    trace(L"export: 滤镜图 " + std::to_wstring(graph.size()) + L" 字符 → " + cmd->graph_file);
+  if (!graph_file.empty()) {
+    trace(L"export: 滤镜图 " + std::to_wstring(graph.size()) + L" 字符 → " + graph_file);
     trace(L"export: graph " + graph);
   }
   cmd->args.push_back(L"-map");
@@ -850,21 +883,25 @@ bool build_export(const Project &p, const std::wstring &out_path, ExportCommand 
 
 Exporter::~Exporter() { cancel(); }
 
-void Exporter::drop_graph_file() {
-  if (!graph_file_.empty()) {
-    DeleteFileW(graph_file_.c_str());
-    graph_file_.clear();
-  }
+void Exporter::drop_temp_files() {
+  for (const std::wstring &f : temp_files_) DeleteFileW(f.c_str());
+  temp_files_.clear();
 }
 
 bool Exporter::start(const Project &proj, const std::wstring &out_path, std::wstring *err) {
   cancel();
   measure_ = env_flag(L"VSE_MEASURE");
   ExportCommand cmd;
-  if (!build_export(proj, out_path, &cmd, err)) return false;
+  if (!build_export(proj, out_path, &cmd, err)) {
+    // 编译到一半失败也已经落盘的文件（文本位图）不能留在临时目录里等下一次同名覆盖。
+    for (const std::wstring &f : cmd.temp_files) DeleteFileW(f.c_str());
+    return false;
+  }
+  // 落盘的文件从这一刻起归 Exporter 管：后面的路任何一条没走成都要把它们收掉。
+  temp_files_ = std::move(cmd.temp_files);
   std::wstring exe, probe;
   if (!Ffmpeg::locate(&exe, &probe)) {
-    drop_graph_file();
+    drop_temp_files();
     if (err) *err = L"找不到 ffmpeg.exe";
     return false;
   }
@@ -874,11 +911,10 @@ bool Exporter::start(const Project &proj, const std::wstring &out_path, std::wst
     self_cpu0_ = self_cpu_ms();
   }
   if (!proc->start(exe, cmd.args, err)) {
-    drop_graph_file();
+    drop_temp_files();
     return false;
   }
   proc_ = std::move(proc);
-  graph_file_ = cmd.graph_file;
   buf_.clear();
   total_ = cmd.total_seconds;
   done_ = 0;
@@ -938,7 +974,7 @@ void Exporter::pump() {
              self / 1000.0, total_);
     trace(mb);
   }
-  drop_graph_file();
+  drop_temp_files();
   wchar_t w[512];
   if (code == 0) {
     swprintf(w, 512, L"导出完成：%ls", out_.c_str());
@@ -951,7 +987,7 @@ void Exporter::pump() {
 }
 
 void Exporter::cancel() {
-  drop_graph_file();
+  drop_temp_files();
   if (!proc_) return;
   proc_->kill();
   proc_.reset();

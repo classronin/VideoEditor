@@ -4,6 +4,7 @@
 #include "app.h"
 
 #include "gesture.h"
+#include "text.h"
 #include "waveform.h"
 
 #include <algorithm>
@@ -224,7 +225,7 @@ StripGeom strip_geom(const App &a, const Clip &c) {
   // 只要 8*scale —— 所以声带在很矮的行里仍然画得出波形，只是不配文字条。
   // seq_draw_waveforms_poll（:147-163）在本工程恒等于「这条是 SOUND」：条带是 SOUND 且有
   // 声带数据、叠加层总开关 SEQ_SHOW_OVERLAY 与「显示所有波形」都是默认值、静音不影响它。
-  const bool wave = c.is_sound;
+  const bool wave = c.kind == kStripSound;
   g.text_overlay = g.body.h >= (wave ? 20.0f : 8.0f) * btheme::scale;
   g.content = g.body.h > (wave ? 8.0f : 20.0f) * btheme::scale;
   // 文字条的「预留」只看高度（Blender 的 strip_content_top 按 can_draw_text_overlay 定，
@@ -360,10 +361,16 @@ struct PropRows {
     y += r.h;
     return r;
   }
+  // 占 n 行的格子（内容框跟着行数长高）。
+  Rect row_n(int n) {
+    Rect r{x, y, w, row_h * float(n)};
+    y += r.h;
+    return r;
+  }
   void gap(float h = 0.25f) { y += h * btheme::u(1.0f); }
-  // 画标签，返回控件应该占的右列矩形。
-  Rect split_row(Render2D &r, const std::wstring &label, Color tc = btheme::panel_text) {
-    Rect rr = row();
+  // 在已经拿到的那一格上画标签，返回控件应该占的右列矩形。行和占多行的格子共用它。
+  Rect split_in(Render2D &r, const Rect &rr, const std::wstring &label,
+                Color tc = btheme::panel_text) {
     float lx = split_x(rr);
     if (!label.empty()) {
       float lw = r.text_width(label, btheme::font_px);
@@ -376,6 +383,10 @@ struct PropRows {
       }
     }
     return {lx, rr.y, rr.x + rr.w - lx, rr.h};
+  }
+  // 画标签，返回控件应该占的右列矩形。
+  Rect split_row(Render2D &r, const std::wstring &label, Color tc = btheme::panel_text) {
+    return split_in(r, row(), label, tc);
   }
   // 标签列与控件列之间那条竖线：整页所有面板共用同一个算法，行与行才对得齐。
   // 面板被拖窄到放不下「标签列 + 一格控件」时退成对半分，控件列至少留一半宽度。
@@ -397,7 +408,7 @@ static Color inactive_wash() {
 
 // 数值按钮上显示的串：编辑态显示键入的内容。进输入态时 edit_text 就是原值整串选中
 // （见 begin_edit），删空之后就真的显示空 —— 和 Blender 的 TextField 一样。
-static std::wstring shown_text(App &a, int id, const Clip *c) {
+static std::wstring shown_text(App &a, int id, Clip *c) {
   if (a.edit_id == id) return a.edit_text;
   return prop_text(a, id, c);
 }
@@ -561,22 +572,38 @@ static void draw_viewport(App &a) {
     r.push_clip(box);
     bool waiting = false;
     for (Clip *c : stack) {
+      // 画面只有两条来源：影片问解码器，文本问排版器（现排一张透明位图，样式没脏就复用同一张）。
+      // 音带不产画面，所以它两条都不问。
+      const txt::Bitmap *bm =
+          c->kind == kStripText ? txt::bitmap(c->text, a.project.fmt.width) : nullptr;
       int fw = 0, fh = 0;
-      const uint8_t *bgra = a.preview.frame(c->id, &fw, &fh);
+      const uint8_t *bgra = nullptr;
+      uint64_t token = 0;
+      if (bm) {
+        bgra = bm->px.data();
+        fw = bm->w;
+        fh = bm->h;
+        token = bm->serial;  // 同一张图 = 同一个号，纹理就不必重新上传
+      } else if (c->kind == kStripMovie) {
+        bgra = a.preview.frame(c->id, &fw, &fh);
+        token = a.preview.frame_token(c->id);
+      }
       if (!bgra) {
-        waiting = true;  // 这一路还没出帧：先画下面已经出的，顶上来时再补
+        // 只有解码那一路的迟到值得说「取帧中」；文本没内容就是没内容。
+        if (c->kind == kStripMovie) waiting = true;
         continue;
       }
       Rect src = clip_base_rect(a, *c, box);
-      float sx = c->info->width ? float(fw) / c->info->width : 1.0f;
-      float sy = c->info->height ? float(fh) / c->info->height : 1.0f;
+      int sw = 0, sh = 0;
+      clip_source_size(a, *c, &sw, &sh);
+      float sx = sw ? float(fw) / sw : 1.0f;
+      float sy = sh ? float(fh) / sh : 1.0f;
       int cl = int(c->crop_l * sx), cr = int(c->crop_r * sx);
       int ct = int(c->crop_t * sy), cb = int(c->crop_b * sy);
       const XformAt x = xform_at(*c, a.project.fmt, a.project.playhead);
       r.image_affine(src, float(x.ofs_x) * sp.x, float(-x.ofs_y) * sp.y, float(x.scale_x),
                      float(x.scale_y), float(x.rotation), bgra, fw, fh, Color{}, cl, cr, ct, cb,
-                     a.preview.frame_token(c->id), c->flip_x, c->flip_y, float(c->origin_x),
-                     float(c->origin_y));
+                     token, c->flip_x, c->flip_y, float(c->origin_x), float(c->origin_y));
     }
     r.pop_clip();
     if (waiting) {
@@ -915,7 +942,7 @@ static void draw_lanes(App &a) {
     bool act = c.id == a.selected;
     // 条带类型色：影片 / 声音两档（userdef_default_theme.c 的 sequencer movie/audio；
     // STRIP_TYPE_SOUND 走 .audio 那一档，见 color3ubv_from_strip_type）。
-    Color base = c.is_sound ? btheme::strip_audio : btheme::strip_movie;
+    Color base = c.kind == kStripSound ? btheme::strip_audio : btheme::strip_movie;
     // SEQ_MUTE：向 {128,128,128} 混合 0.5，再压到 MUTE_ALPHA=120。
     if (c.muted) {
       base = btheme::mix(base, Color{128, 128, 128}, 0.5f);
@@ -1273,9 +1300,20 @@ static void lock_box(App &a, const Rect &box, int field, bool locked) {
 
 // row_active = false 对应 Blender 那一列被 layout.active 关掉：这一行置灰、点不动，
 // 但控件本身还在（码率行就靠它，见输出那一组）。
+// 一格数值按钮：prop_row 和颜色行都用它，所以「编辑态显示键入的串、置灰压一层」这套
+// 规矩只写一遍。
+static void num_cell(App &a, const Rect &v, int id, Clip *c, bool act, bool slider = false,
+                     int anim = 0) {
+  const PropSpec &s = prop_spec(id);
+  const bool editing = act && a.edit_id == id;
+  ui::but_num(a.r2d, a.blk, act ? id : 0, v, L"", shown_text(a, id, c), s.soft_min, s.soft_max,
+              s.step, prop_value(a, id, c), s.precision, s.is_float, slider, editing, anim,
+              editing ? &a.edit_ts : nullptr);
+  if (!act) a.r2d.rrect(v, btheme::radius(0.2f), inactive_wash());
+}
+
 static void prop_row(App &a, PropRows &pr, const std::wstring &label, int id, bool slider,
                      bool row_active = true) {
-  const PropSpec &s = prop_spec(id);
   Clip *c = props_clip(a);
   const bool act = pr.active && row_active;
   Render2D &r = a.r2d;
@@ -1299,17 +1337,85 @@ static void prop_row(App &a, PropRows &pr, const std::wstring &label, int id, bo
     lb = {v.x + v.w - unit, v.y, unit, v.h};
     v.w -= unit;
   }
-  const bool editing = act && a.edit_id == id;
-  ui::but_num(r, a.blk, act ? id : 0, v, L"", shown_text(a, id, c), s.soft_min, s.soft_max,
-              s.step, prop_value(a, id, c), s.precision, s.is_float, slider, editing, anim,
-              editing ? &a.edit_ts : nullptr);
-  if (!act) r.rrect(v, btheme::radius(0.2f), inactive_wash());
+  num_cell(a, v, id, c, act, slider, anim);
   if (lock) lock_box(a, lb, id, id <= kFOfsY ? a.lock_pos : a.lock_scale);
   if (deco) deco_dot(a, db, id, anim);
 }
 
 static void mirror_row(App &a, const PropRows &pr, const Rect &area, const std::wstring &text,
                        int id);
+
+// 内容那一格固定五行（裁决：加高度五行、移到组底部，改字时手不用抬到上面）。
+// 行数不再跟着内容长：格子是有数的界，超过五行的部分裁在框内（but_text 那道 push_clip），
+// 上下键和光标都能走到，只是看不见的那截。
+constexpr int kContentRows = 5;
+
+// 内容行：占 kContentRows 行的文本框，一行一格高。
+static void content_row(App &a, PropRows &pr, Clip *c) {
+  Render2D &r = a.r2d;
+  const float unit = btheme::u(1.0f);
+  const bool act = pr.active;
+  Rect rr = pr.row_n(kContentRows);
+  Rect v = pr.split_in(r, rr, L"内容", act ? btheme::panel_text : dim_text());
+  const bool editing = act && a.edit_id == kFTextContent;
+  ui::but_text(r, a.blk, act ? kFTextContent : 0, v, shown_text(a, kFTextContent, c), editing,
+               editing ? &a.edit_ts : nullptr, unit);
+  if (!act) r.rrect(v, btheme::radius(0.2f), inactive_wash());
+}
+
+// 一层的色块：整块就是这一层的颜色，点下去开系统的选色框。alpha 为 0 时这层本来就不出
+// 画面（排版器读 alpha 判关），色块仍然按 RGB 显示 —— 它是这一层现在存的颜色，不是预览。
+static void color_swatch(App &a, const Rect &area, int layer, Clip *c) {
+  Render2D &r = a.r2d;
+  const float *col = text_layer(text_target(a, c), layer);
+  const Color sw = Color{uint8_t(col[0] * 255.0f + 0.5f), uint8_t(col[1] * 255.0f + 0.5f),
+                         uint8_t(col[2] * 255.0f + 0.5f), 0xff};
+  r.rrect(area, btheme::radius(btheme::wcol_text.roundness), sw);
+  r.rring(area, btheme::radius(btheme::wcol_text.roundness), btheme::pixelsize,
+           btheme::wcol_text.outline);
+  ui::Item it;
+  it.rect = area;
+  it.id = kHitCmd | (kCmdColorGlyph + layer);
+  it.type = ui::Type::Push;
+  it.hot = area.contains(float(a.mouse_x), float(a.mouse_y));
+  a.blk.add(it);
+}
+
+// 颜色行：色块 + 不透明度一格。RGB 那三格按裁决删了：颜色本身归色块（点它开系统选色框，
+// 一套色轮就是给颜色立界，我们不自己画），这一格只管「这一层开多大、透不透」—— 排版器读
+// 的就是 alpha。剩下这一格占满整列，左右拖好抓。id 还是那十二格的下标（app.h 的 Field 表：
+// 每层四格连排，alpha 是第四个），读写走 num_cell 那一套，不另开路。
+static void color_row(App &a, PropRows &pr, const std::wstring &label, int first_id,
+                      Clip *c) {
+  Render2D &r = a.r2d;
+  const bool act = pr.active;
+  Rect v = pr.split_row(r, label, act ? btheme::panel_text : dim_text());
+  const float unit = btheme::u(1.0f);
+  const float m = 0.25f * unit;
+  const float sw = v.h;
+  color_swatch(a, {v.x, v.y, sw, v.h}, text_color_row(first_id), c);
+  v.x += sw + m;
+  v.w -= sw + m;
+  if (v.w <= 0) return;  // 面板拖到极窄：色块已经画下，那一格这一趟不登记
+  num_cell(a, v, first_id + 3, c, act);
+}
+
+// 粗体 / 斜体：一行两颗开关（和变换那组的镜像 X/Y 同一个形状），写在 text_target 的 flag 位上。
+static void style_row(App &a, PropRows &pr, Clip *c) {
+  Render2D &r = a.r2d;
+  const bool act = pr.active;
+  TextVars &t = text_target(a, c);
+  Rect v = pr.split_row(r, L"字形", act ? btheme::panel_text : dim_text());
+  const float m = 0.25f * btheme::u(1.0f);
+  const float bw = (v.w - m) / 2.0f;
+  ui::but_toggle(r, a.blk, act ? kFTextBold : 0, {v.x, v.y, bw, v.h}, L"", t.bold, L"粗体");
+  ui::but_toggle(r, a.blk, act ? kFTextItalic : 0, {v.x + bw + m, v.y, bw, v.h}, L"", t.italic,
+                 L"斜体");
+  if (!act) {
+    r.rrect({v.x, v.y, bw, v.h}, btheme::radius(0.2f), inactive_wash());
+    r.rrect({v.x + bw + m, v.y, bw, v.h}, btheme::radius(0.2f), inactive_wash());
+  }
+}
 
 // 面板自己的滚动条：形状读同一档 wcol_scroll（时间线那条也是它），位置在面板内缘，
 // 见 ops.cpp 的 props_scroll_trough。内容放得下时滑块是空矩形 = 一条都不画。
@@ -1346,7 +1452,28 @@ static const PanelSpec kPanelSpecs[kPanelCount] = {
     {L"速度", 1, 0, 0.0f},
     {L"帧范围", 3, 0, 0.0f},
     {L"输出", 4, 0, 0.0f},
+    // 文本：字体 + 字形 + 字号 + 行距 + 三层颜色 + 轮廓宽 + 边距 + 圆度 + 内容。内容是
+    // kContentRows 行的框，排在最下面（改字时手不用抬到上面），所以行数里单独把它列出来。
+    // 组与组之间三个间隔：字号前、颜色前、内容前。
+    {L"文本", 2 + 2 + 6 + kContentRows, 0, 3.0f},
 };
+
+// 这一组在这一趟出现吗。判据是面板此刻演哪一种（a.panel_kind），不是选中条带的类型：
+// 两颗种类按钮放开以后，「演文本但选中是别的带」是合法状态，这时格式/输出/帧范围那些
+// 非文本的控件必须不出现，否则用户照原样点得到导出。画的时候和画之前量总高的时候都问
+// 这同一个函数 —— 各判一次就是两个写者，滚动条会先出现、行宽慢一帧才让位。
+static bool panel_shown(const App &a, int idx) {
+  const bool text = a.panel_kind == kStripText;
+  switch (idx) {
+    case kPCrop:
+    case kPSpeed: return !text;
+    case kPText: return text;
+    case kPFormat:
+    case kPOutput:
+    case kPRange: return !text;
+    default: return true;
+  }
+}
 
 static int panel_rows(const App &a, int idx) {
   const PanelSpec &p = kPanelSpecs[idx];
@@ -1364,12 +1491,13 @@ static float panel_h(const App &a, int idx) {
          pad * 2.0f;
 }
 
-// 整页内容总高 = 每组的高加上组与组之间那格 pad；末组下面多出来的那格正好补第一组上面的
-// 那格，所以从 a.props.y + pad 起算的整段就是滚到底的画面。
+// 整页内容总高 = 顶部那行种类按钮 + 每一组的高加上组与组之间那格 pad；末组下面多出来的
+// 那格正好补第一组上面的那格，所以从 a.props.y + pad 起算的整段就是滚到底的画面。
 static float props_content_h(const App &a) {
   const float pad = 0.25f * btheme::u(1.0f);
-  float h = 0.0f;
-  for (int i = 0; i < kPanelCount; i++) h += panel_h(a, i) + pad;
+  float h = btheme::u(1.0f) + pad;  // 种类按钮那一行
+  for (int i = 0; i < kPanelCount; i++)
+    if (panel_shown(a, i)) h += panel_h(a, i) + pad;
   return h;
 }
 
@@ -1399,6 +1527,24 @@ static PropRows begin_panel(App &a, int idx, float &y) {
   return pr;
 }
 
+// 面板顶部那两颗种类按钮。亮的那颗读 a.panel_kind（面板演哪一种就这一个出处），按下去无条件
+// 换它 —— 没有条件、没有拒绝：时间线里还没有这一种的带时，文本行落在 a.text_def 上照样改。
+static void kind_buttons(App &a, float &y) {
+  Render2D &r = a.r2d;
+  const float pad = 0.25f * btheme::u(1.0f);
+  const float unit = btheme::u(1.0f);
+  const float g = props_gutter(a);
+  const Rect row{a.props.x + pad + (a.props_side ? g : 0.0f), y, a.props.w - pad * 2.0f - g, unit};
+  const float m = 0.25f * unit;
+  const float bw = (row.w - m) * 0.5f;
+  const bool text = a.panel_kind == kStripText;
+  ui::but_toggle(r, a.blk, kHitCmd | kCmdPickVideoStrip, {row.x, row.y, bw, row.h}, L"", !text,
+                 L"视频");
+  ui::but_toggle(r, a.blk, kHitCmd | kCmdPickTextStrip, {row.x + bw + m, row.y, bw, row.h}, L"",
+                 text, L"文本");
+  y += unit + pad;
+}
+
 static void draw_props(App &a) {
   Render2D &r = a.r2d;
   if (a.props.w <= 0) return;
@@ -1424,7 +1570,10 @@ static void draw_props(App &a) {
   // 改成和静音一样置灰：条目照常显示，prop_row 把 id 登记成 0 所以点下去不动作。
   PropRows::Active strip_active{has_strip && !c->muted};
 
-  {
+  kind_buttons(a, y);
+
+  // 演文本时这一组不出现：面板递到文本行照样一个字不改，但点得到就不是「移除」了。
+  if (panel_shown(a, kPFormat)) {
     // ---- 格式（RENDER_PT_format，properties_output.py:109-132）
     // 三个 column(align=True)：分辨率 X/Y/% → 宽高比 X/Y → Frame Rate 一列。
     // use_border / use_crop_to_border 没有渲染边框概念，整组不列。
@@ -1482,9 +1631,40 @@ static void draw_props(App &a) {
       }
     }
   }
+  // ---- 文本（本项目的文本条带样式：字体字形 / 字号行距 / 三层颜色与它们的参数 / 内容）
+  // 面板演文本时才出现（panel_shown），位置在变换下面（裁决）。组内内容排在最下面：改字时
+  // 鼠标停在左侧那一截，不用抬到上面去。每一行写的都是 text_target 的那份 TextVars ——
+  // 选中不是文本带时落在 a.text_def，是文本带时落在这条带自己身上，两条路只有一个出处。
+  if (panel_shown(a, kPText)) {
+    PropRows pr = begin_panel(a, kPText, y);
+    pr.active = strip_active;
+    if (pr.rows) {
+      {
+        // 字体 = 系统枚举出来的家族（txt::families），当前值就是按钮文字，
+        // 下拉里同名的那一行带勾（build_menus 读的是同一个 text_target）。
+        Rect v = pr.split_row(r, L"字体");
+        menu_btn(a, v, kHitMenu | kMFont, text_target(a, c).family,
+                 a.hover == (kHitMenu | kMFont));
+      }
+      style_row(a, pr, c);
+      pr.gap();
+      prop_row(a, pr, L"字号", kFTextSize, true);
+      prop_row(a, pr, L"行距", kFTextLineSpacing, true);
+      pr.gap();
+      color_row(a, pr, L"字色", kFGlyphR, c);
+      color_row(a, pr, L"轮廓色", kFOutlineR, c);
+      // 相对量按原值给：轮廓按行高、边距按画布宽、圆度按盒高的一半（算式都在 text.cpp）。
+      prop_row(a, pr, L"轮廓宽", kFTextOutlineWidth, true);
+      color_row(a, pr, L"方框色", kFBoxR, c);
+      prop_row(a, pr, L"边距", kFTextBoxMargin, true);
+      prop_row(a, pr, L"圆度", kFTextBoxRoundness, true);
+      pr.gap();
+      content_row(a, pr, c);
+    }
+  }
   // ---- 裁切（STRIP_PT_adjust_crop，properties_strip.py:116-137；DEFAULT_CLOSED）
   // 行序照抄：crop.min_x / max_x / max_y / min_y = 左 右 上 下。
-  {
+  if (panel_shown(a, kPCrop)) {
     PropRows pr = begin_panel(a, kPCrop, y);
     pr.active = strip_active;
     if (pr.rows) {
@@ -1497,7 +1677,7 @@ static void draw_props(App &a) {
   // ---- 速度（对应 Blender 的 sequencer.retiming_segment_speed_set，R 键那个算子）
   // 一条 align 列：只有「速度」一格，百分数，100% = 原速。改它吃掉的源内容不变，
   // 条带在时间线上变长/变短（strip_retiming.cc:239 new_duration = 内容 / speed）。
-  {
+  if (panel_shown(a, kPSpeed)) {
     PropRows pr = begin_panel(a, kPSpeed, y);
     pr.active = strip_active;
     if (pr.rows) {
@@ -1508,7 +1688,7 @@ static void draw_props(App &a) {
   // 一个 align 列：Frame Start / End / Step，三行逐字照 Blender 的列序。
   // 开始/结束同时是播放范围（scene.cc:2607-2633 的 BKE_scene_get_playback_range = sfra..efra），
   // 所以 Ctrl+Home / Ctrl+End 跳的就是这两格；步长不进播放，只进导出（见 types.h 的 frame_step）。
-  {
+  if (panel_shown(a, kPRange)) {
     PropRows pr = begin_panel(a, kPRange, y);
     if (pr.rows) {
       prop_row(a, pr, L"开始帧", kFFrameStart, false);
@@ -1521,7 +1701,7 @@ static void draw_props(App &a) {
   // :604 ffmpeg_preset、:658 audio_codec。
   // 容器和文件名不在这一组里：容器只有一个（导出的就是 MP4，见 export.cpp），文件名的落点是
   // 导出对话框那颗「保存」，都无须在面板占一行。导出这颗按钮按要求摆在顶栏，不在这里。
-  {
+  if (panel_shown(a, kPOutput)) {
     PropRows pr = begin_panel(a, kPOutput, y);
     if (pr.rows) {
       {

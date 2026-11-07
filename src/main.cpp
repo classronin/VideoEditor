@@ -323,21 +323,54 @@ void edit_set_caret(App &a, int pos, bool select) {
   a.dirty = kRegionAll;
 }
 
-// 指针 x 落在框内哪两个字符之间：取最近的那个边界，框外的自然夹到串首/串尾。
-void edit_caret_at_x(App &a, const ui::Item &it, float x, bool select) {
-  edit_set_caret(a, ui::text_index_at(a.r2d, edit_buf(a), it.text_x, x), select);
+// 指针落在框内哪两个字符之间：取最近的那个边界，框外的自然夹到串首/串尾。
+// 多行框（内容那一行）先看 y 落在第几行，再在那一行里看 x；单行框只问 x。
+void edit_caret_at(App &a, const ui::Item &it, float x, float y, bool select) {
+  const int pos =
+      it.line_h > 0.0f
+          ? ui::text_index_at(a.r2d, edit_buf(a), it.rect, it.text_x, it.line_h, x, y)
+          : ui::text_index_at(a.r2d, edit_buf(a), it.text_x, x);
+  edit_set_caret(a, pos, select);
+}
+
+// 上下键换行：只有多行的内容框管上下（Blender 也一样 —— 数值框的上下是步进，textbox 才是换行，
+// interface_handlers.cc:4335 → textbox_jump_line）。保住的是水平像素而不是字符列：一行里两个
+// 汉字和两个字母宽度不同，按列走会斜。第一行按上 = 串首，最后一行按下 = 串尾（同 Blender）。
+void edit_move_line(App &a, int dir, bool select) {
+  ui::Item *it = a.blk.find(edit_item_id(a));
+  if (!it) return;
+  const std::wstring &t = edit_buf(a);
+  const std::vector<ui::TextLine> lines = ui::text_lines(t);
+  int li = int(lines.size()) - 1;
+  for (int i = 0; i < int(lines.size()); i++)
+    if (a.edit_ts.caret <= lines[i].end) {
+      li = i;
+      break;
+    }
+  const int target = li + dir;
+  if (target < 0) return edit_set_caret(a, 0, select);
+  if (target >= int(lines.size())) return edit_set_caret(a, INT_MAX, select);
+  const int caret = a.edit_ts.caret;
+  const float cx =
+      it->text_x + a.r2d.text_width(t.substr(lines[li].begin, caret - lines[li].begin),
+                                    btheme::font_px);
+  const std::wstring dest = t.substr(lines[target].begin, lines[target].end - lines[target].begin);
+  edit_set_caret(a, lines[target].begin + ui::text_index_at(a.r2d, dest, it->text_x, cx), select);
 }
 
 bool edit_char(App &a, wchar_t c) {
-  if (c < 0x20) return false;  // Enter / Esc / Backspace 走 WM_KEYDOWN
+  // 控制字符（Enter / Esc / 退格）从 WM_KEYDOWN 那一头进来，WM_CHAR 不产它们。
+  // 唯一的例外：内容框的 Ctrl+Enter 要真的落一个换行。
+  if (c < 0x20 && !(c == L'\n' && is_string_field(a.edit_id))) return false;
   std::wstring &t = edit_buf(a);
   int lo, hi;
   edit_bounds(a, lo, hi);
   const bool had_sel = hi > lo;
   // 校验看「吃掉选区之后」的那串：被拒的字符不能顺手把选区删掉。
   std::wstring rest = had_sel ? std::wstring(t).erase(size_t(lo), size_t(hi - lo)) : t;
-  // Field id 从 0x1000 起，全都是数值按钮；唯一的文本框是轨道重命名。
-  const bool numeric = a.rename_track < 0;
+  // 数值按钮的 id 从 0x1000 起，内容那一行也在其中，所以「是不是数字」问的是 Field 表，
+  // 不是问「有没有在改轨道名」。
+  const bool numeric = a.rename_track < 0 && !is_string_field(a.edit_id);
   if (numeric) {
     if (c == L'.' || c == L',') c = L'.';
     const bool digit = c >= L'0' && c <= L'9';
@@ -345,8 +378,8 @@ bool edit_char(App &a, wchar_t c) {
     if (c == L'.' && rest.find(L'.') != std::wstring::npos) return false;
     if (c == L'-' && (lo != 0 || rest.find(L'-') != std::wstring::npos)) return false;
     if (!(digit || c == L'.' || c == L'-') || rest.size() >= 16) return false;
-  } else if (rest.size() >= 64) {
-    return false;
+  } else if (a.rename_track >= 0 && rest.size() >= 64) {
+    return false;  // 通道名那一格；内容行没有上限，字条带想写多长写多长
   }
   if (had_sel) {  // 全选/拖选都在此生效：先删掉选区，再从光标处插入
     t.erase(size_t(lo), size_t(hi - lo));
@@ -423,9 +456,9 @@ void begin_rename(App &a, int track) {
 
 // 左键按在已经打开的输入框里：先记住按下时的字符边界，再放光标；
 // 之后拖动就从这个边界往外拖出选区（和 Windows/Blender 的文本框一致）。
-void begin_text_select(App &a, const ui::Item &it, float x) {
+void begin_text_select(App &a, const ui::Item &it, float x, float y) {
   a.edit_anchor = a.edit_ts.caret;
-  edit_caret_at_x(a, it, x, false);
+  edit_caret_at(a, it, x, y, false);
 }
 
 // ---------------------------------------------------------------- 命中辅助
@@ -614,7 +647,7 @@ void on_lbutton_down(App &a, int x, int y) {
       Track &tr = channel_slot(a, track);
       if (kind == kChanName) {
         if (a.rename_track == track) {  // 重命名框已开：点里面放光标、按住拖出选区
-          begin_text_select(a, *it, fx);
+          begin_text_select(a, *it, fx, fy);
           return;
         }
         // 普通左键不动作；Ctrl+左键 / 双击 = 重命名（km_sequencer_channels:3464）。
@@ -632,15 +665,22 @@ void on_lbutton_down(App &a, int x, int y) {
       undo_push(a, kind == kChanLock ? L"锁定通道" : L"静音通道");
       return;
     }
-    if (base == 0 && id >= kFNone) {  // Field：数值按钮或布尔勾选
+    if (base == 0 && id >= kFNone) {  // Field：数值按钮、布尔勾选、文本框
       if (is_bool_field(id)) {
         prop_toggle(a, id, props_clip(a));
+        return;
+      }
+      // 文本框（内容那一行）：按下就进输入态，光标落在点的那里，拖动只拖选区。
+      // 数值按钮那套横向拖动对一串字没有意义，所以这条路根本不进 ndrag。
+      if (it->type == ui::Type::Text) {
+        if (a.edit_id != id) begin_edit(a, id, prop_text(a, id, props_clip(a)));
+        begin_text_select(a, *it, fx, fy);
         return;
       }
       // 这一格已经在输入：左键改成放光标、按住拖出选区，不再当作数值拖动的起点。
       // 否则「按在数字上往左拖」会被读成改值，选不动字。
       if (a.edit_id == id) {
-        begin_text_select(a, *it, fx);
+        begin_text_select(a, *it, fx, fy);
         return;
       }
       ui::num_drag_begin(a.blk, a.ndrag, id, x);
@@ -668,7 +708,7 @@ void on_lbutton_dblclk(App &a, int x, int y) {
   // Windows 把第二次按下发成 DBLCLK 而不是 LBUTTONDOWN，所以正在输入的框里
   // 双击也必须能落到光标上，否则连点第二下什么都不做。
   else if (it && it->id && it->id == edit_item_id(a))
-    begin_text_select(a, *it, float(x));
+    begin_text_select(a, *it, float(x), float(y));
 }
 
 // 闭环平移的光标（GHOST_SystemWin32.cc:1191-1238 的 warp 分支 + GHOST_Rect::wrapPoint）
@@ -689,7 +729,7 @@ void on_mouse_move(App &a, int x, int y, bool down) {
   }
   if (a.edit_anchor >= 0) {  // 按住输入框里的字拖动：选区从按下那点拖到当前指针
     ui::Item *ed = a.blk.find(edit_item_id(a));
-    if (ed) edit_caret_at_x(a, *ed, float(x), true);
+    if (ed) edit_caret_at(a, *ed, float(x), float(y), true);
     return;
   }
   if (a.ndrag.dragging) {  // 数值按钮：横向拖动改值（interface_handlers.cc:6126-6240）
@@ -774,6 +814,10 @@ void on_mbutton_up(App &a) { release_gesture(a); }
 // on_wheel = wheel_step + 一行结果 trace。滚轮的四种分工（缩放/Ctrl 横移/Shift 纵移/
 // Alt 逐帧）光看画面分不出来，把改动前后的视图参数打进日志才好核对。
 void on_wheel(App &a, int x, int y, short delta) {
+  if (a.pop.is_open()) {  // 菜单开着：滚轮翻菜单，不碰时间线和面板
+    if (a.pop.on_wheel(delta)) a.dirty = kRegionAll;
+    return;
+  }
   const WORD mods = mod_state();
   const double pps0 = a.tl.pps, st0 = a.tl.scroll_t, vc0 = a.tl.view_ch;
   const float z0 = a.view_zoom, px0 = a.view_pan_x, py0 = a.view_pan_y;
@@ -809,7 +853,13 @@ void on_key(App &a, WORD vk) {
     int c = a.edit_ts.caret;
     if (vk == VK_ESCAPE)
       ren ? commit_rename(a, false) : commit_edit(a, false);
-    else if (vk == VK_RETURN)
+    else if (vk == VK_RETURN && !ren && is_string_field(a.edit_id)) {
+      // 内容框：回车换行，Ctrl+回车提交（裁决改口：Ctrl+回车不再换行）。点到框外也提交。
+      if (mods & kCtrl)
+        commit_edit(a, true);
+      else
+        edit_char(a, L'\n');
+    } else if (vk == VK_RETURN)
       ren ? commit_rename(a, true) : commit_edit(a, true);
     else if (vk == VK_BACK)
       edit_backspace(a);
@@ -823,6 +873,8 @@ void on_key(App &a, WORD vk) {
       edit_set_caret(a, 0, shift);
     else if (vk == VK_END)
       edit_set_caret(a, INT_MAX, shift);
+    else if ((vk == VK_UP || vk == VK_DOWN) && is_string_field(a.edit_id))
+      edit_move_line(a, vk == VK_DOWN ? 1 : -1, shift);
     a.dirty = kRegionAll;
     return;
   }
@@ -1257,9 +1309,9 @@ static LRESULT handle_msg(App &a, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
       KillTimer(hwnd, kTick);
       a.tick_armed = false;
-      // 左侧那枚小三角此刻是展开还是收起，关窗口时自己落盘（只改 layout 行的折叠位，
-      // 其余行原样）：这一位不需要用户再点一次「保存启动默认」。
-      settings_save_collapse(a);
+      // 关闭 exe = 保存启动默认：窗口状态、格式参数、布局、小三角、文本组整份落盘，
+      // 不需要用户再点一次菜单（菜单里只留「恢复启动默认」）。
+      settings_save(a);
       g_publish_hwnd = nullptr;  // 之后 worker 再说「有东西了」就丢掉：窗口已经没有了
       // 关窗口就是关窗口：正在跑的导出先掐掉（ffmpeg 只靠 -progress 管道连着主程序，
       // 输出却写进文件，主程序没了它也不会察觉，会自己闷头跑到完 —— 任务管理器里
@@ -1307,11 +1359,14 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
   // 好让验证脚本和手输碰到的是同一段时长联动代码。
   // --key 通道:帧:值 给第一个片段插一个关键帧（通道 0=位置X 1=位置Y 2=缩放X
   // 3=缩放Y 4=旋转），可重复；求值结果写进日志的 xform_at 行。
+  // --text 调的就是右键「添加文本」那一个算子（不是另开一条造数据的路），好让截图能证明
+  // 用户点到的那条链真的落下条带、排版器真的出图。
   std::vector<std::wstring> files;
   std::wstring shot, export_path, drop_file, ffmpeg_url;
   bool ffmpeg_fetch = false;
   double seek = -1.0, hold = 0.0, export_delay = -1.0;
   bool cut = false, play = false;
+  int add_txt = 0;
   int crop[4] = {0, 0, 0, 0};
   double xs = 1.0, ys = 1.0, rot = 0.0, ox = 0.0, oy = 0.0;
   double org_x = 0.5, org_y = 0.5;
@@ -1331,6 +1386,13 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
     double start;
   };
   std::vector<AtMove> at_list;
+  // --slide 片段序号:横移帧:纵移通道 —— 没有鼠标也能走真的模态那条路（modal_begin →
+  // modal_update → modal_end 提交）：落位让位、关键帧跟随、撤消步都和鼠标拖出来的一样。
+  // 配 --at 先摆出重叠，再复现「拖到已有条带上松手」那一下。kill switch: 不过门即删，不优化
+  struct SlideMove {
+    int idx, frames, channels;
+  };
+  std::vector<SlideMove> slide_list;
   // --wheel 客户区x:y:格数 —— 投真的 WM_MOUSEWHEEL 给本窗口，走窗口过程那一路：滚轮落在
   // 哪一块地方就由哪一块对象回答，所以这条不改任何属性，只送事件。正数 = 上滚。
   // kill switch: 不过门即删，不优化
@@ -1378,6 +1440,7 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
     else if (s == L"--seek" && i + 1 < argc) seek = wcstod(argv[++i], nullptr);
     else if (s == L"--hold" && i + 1 < argc) hold = wcstod(argv[++i], nullptr);
     else if (s == L"--cut") cut = true;
+    else if (s == L"--text") ++add_txt;  // 写几次就建几条，叠着的文本带正是排版器共用一张图的那种
     else if (s == L"--play") play = true;
     else if (s == L"--fmt-source") fmt_source = true;
     else if (s == L"--cuts" && i + 1 < argc) {
@@ -1435,6 +1498,9 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
     } else if (s == L"--at" && i + 1 < argc) {
       double v[3];
       if (parse_doubles(argv[++i], v, 3)) at_list.push_back({int(v[0]), int(v[1]), v[2]});
+    } else if (s == L"--slide" && i + 1 < argc) {
+      double v[3];
+      if (parse_doubles(argv[++i], v, 3)) slide_list.push_back({int(v[0]), int(v[1]), int(v[2])});
     } else if (s == L"--wheel" && i + 1 < argc) {
       double v[3];
       if (parse_doubles(argv[++i], v, 3)) {
@@ -1557,6 +1623,13 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
   }
 
   import_paths(g, files);
+  // 播放头先落，再建文本带：add_text 的起点读的就是播放头（右键那一条也是），把 seek 排在它
+  // 之前，「--seek + --text」交出的落位才和用户在界面里拖过去再点右键是同一个数。
+  if (seek >= 0) g.project.playhead = seek;
+  // --text：走右键那一个算子（add_text），落位、默认内容、默认长度都由它自己说。排在改数据
+  // 那几组旗标之前 —— 它们只认第一个片段，而文本带是追加到末尾的；先建出来，命令行才谈得上
+  // 给文本带本身设变换、插关键帧（用户报的「旋转 + 移位后导出」就是这么来的）。
+  for (int k = 0; k < add_txt; k++) add_text(g);
   // --at：把指定片段搬到「通道 + 起始秒」。只做数据搬运，界面在下一次重绘时自己跟上。
   // 通道不够就先补出来（本工程按需建 Track，见 channel_slot）。
   for (const AtMove &m : at_list)
@@ -1567,6 +1640,22 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
       c.timeline_start = m.start;
     }
   if (!at_list.empty()) g.dirty = kRegionAll;
+  for (const SlideMove &m : slide_list) {
+    if (m.idx < 0 || m.idx >= int(g.project.clips.size())) continue;
+    select_only(g, g.project.clips[size_t(m.idx)].id);
+    g.mouse_x = 0;
+    g.mouse_y = 0;
+    modal_begin(g, ModalState::Slide);
+    g.mouse_y = float(-m.channels * channel_h(g));
+    modal_update(g, g.project.playhead + double(m.frames) * g.frame_dur());
+    modal_end(g, true);
+    const Clip &c = g.project.clips[size_t(m.idx)];
+    wchar_t sb[128];
+    swprintf(sb, 128, L"slide cli: id=%lld 通道=%d 起=%lld帧", (long long)c.id, c.track,
+             (long long)g.t_to_frame(c.timeline_start));
+    trace(sb);
+  }
+  if (!slide_list.empty()) g.dirty = kRegionAll;
   if (has_crop || has_xform || has_org || has_speed) {
     for (Clip &c : g.project.clips) {
       if (has_crop) {
@@ -1578,7 +1667,6 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
       if (has_org) {
         c.origin_x = org_x; c.origin_y = org_y;
       }
-      // 速度不能直接写字段：内容不变、条带长度要按 1/speed 重算，那是 prop_apply 的活。
       // 速度不能直接写字段：内容不变、条带长度要按 1/speed 重算，那是 prop_apply 的活。
       for (double sp : speed_list) prop_apply(g, kFSpeed, &c, sp);
       if (has_speed) trace_retime(g, c, L"speed-chain");
@@ -1606,7 +1694,6 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
     Clip &c = g.project.clips.front();
     c.anim[ch].set_at(key_list[k + 1], float(key_list[k + 2]));
   }
-  if (seek >= 0) g.project.playhead = seek;
   // 求值结果打成一行日志：验证插值时读这个数，比量截图像素可靠。
   if (!key_list.empty() && !g.project.clips.empty()) {
     const XformAt x = xform_at(g.project.clips.front(), g.project.fmt, g.project.playhead);
@@ -1636,7 +1723,7 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
   // 59.94 有音轨」。kill switch: 不过门即删，不优化
   if (fmt_source) {
     for (Clip &c : g.project.clips) {
-      if (c.is_sound || !c.info) continue;
+      if (c.kind != kStripMovie || !c.info) continue;
       const VideoInfo &vi = *c.info;
       OutputFormat &f = g.project.fmt;
       if (vi.width > 0 && vi.height > 0) {
@@ -1674,6 +1761,8 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
       clear_selection(g);
       int hit = 0;
       for (Clip &c : g.project.clips) {
+        // 切分找的是素材自己那条带：--text 建的文本带不参与（它现在排在切分之前建出来）。
+        if (c.kind == kStripText) continue;
         if (t > c.timeline_start && t < c.timeline_start + c.duration) {
           add_to_selection(g, c.id);
           hit++;
@@ -1689,12 +1778,13 @@ int WINAPI wWinMain(HINSTANCE self, HINSTANCE, PWSTR, int) {
   }
   if (cut) {
     Clip *c = clip_at(g, g.project.playhead);
+    if (c && c->kind == kStripText) c = nullptr;  // 同 --cuts：切分只管素材带
     if (c) {
       select_only(g, c->id);
       split_selected(g, false);
     }
   }
-  if (seek >= 0 || cut || !files.empty()) sync_preview(g);
+  if (seek >= 0 || cut || !files.empty() || add_txt) sync_preview(g);
   if (!g.shot_path.empty()) g.shot_deadline = now_seconds() + 4.0 + hold;
   g.shot_hold = now_seconds() + hold;
   if (play) {
