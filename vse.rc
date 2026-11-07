@@ -1,0 +1,3 @@
+// Windows 资源。第 1 号 ICON 同时是 exe 文件图标、窗口标题栏图标和任务栏图标
+// （类的 hIcon/hIconSm 读的就是它，见 main.cpp 的 RegisterClassW 那一段）。
+1 ICON "icon.ico"
